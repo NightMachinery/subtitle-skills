@@ -598,6 +598,10 @@ def make_cues(words, duration):
         choices = []
         for end in range(position + 1, min(len(words), position + 22) + 1):
             group = words[position:end]
+            # Speaker IDs are section-local. Do not invent a speaker change by
+            # combining independent diarization sections into one dialogue cue.
+            if group[-1].get('section') != group[0].get('section'):
+                break
             text = cue_text(group)
             latest_end = max(word['end'] for word in group)
             if text is None or latest_end - group[0]['start'] > 6.5:
@@ -874,7 +878,7 @@ def process_episode(video, args, pool):
                     index = chunk['index']
                     for word in timed_words(results[index], chunk['end'] - chunk['start']):
                         word.update(start=word['start'] + chunk['start'], end=word['end'] + chunk['start'],
-                                    speaker=f"{index}:{word['speaker']}", id=len(words))
+                                    speaker=f"{index}:{word['speaker']}", section=index, id=len(words))
                         words.append(word)
                 corrections, flags = repair_long_words(words, preparation['silences'])
                 words.sort(key=lambda word: (word['start'], word['id']))

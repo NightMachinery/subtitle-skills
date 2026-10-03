@@ -485,6 +485,17 @@ class RunnerTests(unittest.TestCase):
         error.close()
         self.assertEqual(diagnostic, {'http_status': 429, 'category': 'resource_exhausted_unspecified'})
 
+    def test_section_boundary_does_not_invent_dialogue(self):
+        words = [
+            {'id': 0, 'word': 'the', 'start': 0.0, 'end': 0.3, 'speaker': '0:1', 'section': 0},
+            {'id': 1, 'word': 'environment', 'start': 0.5, 'end': 1.2, 'speaker': '1:1', 'section': 1},
+            {'id': 2, 'word': 'matters.', 'start': 1.2, 'end': 1.6, 'speaker': '1:1', 'section': 1}]
+        cues = t.make_cues(words, 2.0)
+        t.validate_cues(cues, words, 2.0)
+        self.assertEqual([c['text'] for c in cues], ['the', 'environment matters.'])
+        self.assertFalse(any(c['text'].startswith('- ') for c in cues))
+        self.assertEqual([i for c in cues for i in c['word_ids']], [0, 1, 2])
+
     def test_vertex_long_metric_identifies_request_quota(self):
         body = {'error': {'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo',
             'metadata': {'quota_metric': 'aiplatform.googleapis.com/generate_content_requests_per_minute_per_project_per_base_model',
