@@ -17,3 +17,4 @@ config.toml
 .env
 .env.*
 .venv/
+*.subtitles.json5

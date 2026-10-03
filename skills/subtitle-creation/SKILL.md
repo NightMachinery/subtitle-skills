@@ -73,13 +73,15 @@ project's quota. Creating subtitles authorizes those necessary API calls;
 avoid a separate test call when the established model already works.
 
 The runner splits audio at pauses into short sections, caches completed API
-responses, handles concurrent speech using speaker labels, and publishes only
-complete validated SRT files. Its initial `<media-stem>.source.srt` is a native
-transcript draft, not an English translation. Inspect representative cue text
-to identify the spoken language, using detected-language metadata if present.
-Do not rely on a container language tag alone. If it is ambiguous or mixed,
-preserve the native draft and ask for a labeling preference; do not silently
-force English.
+responses, and handles concurrent speech using speaker labels. It saves only
+native language-tagged SRT files, never `.source.srt` drafts. When the spoken
+language is not confirmed, it caches native words and cues as JSON and returns
+`needs_language` without publishing an SRT. Exit code 2 means labeling is still
+needed; 0 means completed/skipped and 1 means failure. Inspect representative text in
+`words.json` or `cues.json` to identify the language, using detected-language
+metadata if present. Do not rely on a container language tag alone. If it is
+ambiguous or mixed, keep the JSON checkpoints and ask for a labeling preference;
+do not silently force English.
 
 Publish the identified source language without retranscription:
 
@@ -89,12 +91,14 @@ python3 "$SKILL_DIR/scripts/transcribe.py" "episode2.mp4" "episode3.mp4" \
 ```
 
 Replace `en` with the actual language tag. The output tag changes presentation,
-not cached transcription settings. Keep the source draft in the checkpoint or
-remove that duplicate draft only after the labeled original-language SRT has
-been verified; deliver the labeled files. If the output language is known from
-an explicit user instruction, pass `--output-language` on the initial command.
-For future English-only reruns, specify `--output-language en` to skip existing
-English outputs instead of recreating a native draft.
+not cached transcription settings. If the native language is known, pass
+`--output-language` on the initial command. The runner records
+`original_language` and `original_subtitle` in a pretty-printed
+`<media-stem>.subtitles.json5` sidecar, using strict JSON syntax compatible with JSON5 (the reader does not
+accept comments or trailing commas).
+Future default runs can reuse that native-language label and skip existing valid
+outputs before authentication or spend. Keep original and translated SRTs only;
+remove redundant drafts from older runs after verifying the tagged originals.
 
 Known HTTP 429 and server rejections get at most two retries, with roughly
 60/120-second exponential cooldowns and jitter. Server retry advice is honored

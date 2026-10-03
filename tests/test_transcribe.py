@@ -38,7 +38,7 @@ def response():
 
 def args_for(video, directory, *extra):
     return t.parser().parse_args([str(video), '--cache-dir', str(directory / 'cache'),
-                                  '--model', 'test-transcribe', *extra])
+                                  '--model', 'test-transcribe', '--output-language', 'en', *extra])
 
 
 def fixture(directory):
@@ -225,7 +225,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_completed_skip_no_auth_or_extraction(self):
         video = self.directory / 'does-not-need-to-exist.wav'
-        output = video.with_suffix('.source.srt')
+        output = video.with_suffix('.en.srt')
         output.write_text('1\n00:00:00,100 --> 00:00:01,000\nReviewed subtitle.\n')
         pool = self.pool()
         with patch.object(pool, 'token', side_effect=AssertionError('auth called')), \
@@ -236,7 +236,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_invalid_existing_output_preserved_without_auth(self):
         video = self.directory / 'episode.wav'
-        output = video.with_suffix('.source.srt')
+        output = video.with_suffix('.en.srt')
         output.write_text('review draft')
         pool = self.pool()
         with patch.object(pool, 'token', side_effect=AssertionError('auth called')):
@@ -320,22 +320,28 @@ class RunnerTests(unittest.TestCase):
         result = t.process_episode(video, args, self.pool())
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(result['word_count'], 4)
-        self.assertTrue(t.valid_srt(video.with_suffix('.source.srt')))
+        self.assertTrue(t.valid_srt(video.with_suffix('.en.srt')))
         self.assertEqual(result['usage']['input_audio_tokens'], 321)
         self.assertNotIn('test-project', (cache / 'result.json').read_text())
         self.assertNotIn('offline-token', (cache / 'chunk-000.json').read_text())
 
     def test_confirmed_language_renaming_only_reuses_cache(self):
         video, args, cache = fixture(self.directory)
+        args.output_language = None
         original = t.process_episode(video, args, self.pool())
-        self.assertEqual(original['status'], 'completed')
+        self.assertEqual(original['status'], 'needs_language')
+        self.assertIsNone(original['output'])
+        self.assertEqual(list(self.directory.rglob('*.srt')), [])
         args.format_only, args.output_language = True, 'fr'
         pool = self.pool()
         with patch.object(pool, 'token', side_effect=AssertionError('auth called')):
             tagged = t.process_episode(video, args, pool)
         self.assertEqual(tagged['status'], 'completed')
-        self.assertEqual(video.with_suffix('.source.srt').read_bytes(), video.with_suffix('.fr.srt').read_bytes())
+        self.assertEqual(t.render_srt(t.read_json(cache / 'cues.json')), video.with_suffix('.fr.srt').read_text())
         self.assertEqual(original['cache'], tagged['cache'])
+        self.assertFalse((cache / 'validated.srt').exists())
+        self.assertFalse(video.with_suffix('.source.srt').exists())
+        self.assertEqual(t.read_metadata(video), {'original_language': 'fr', 'original_subtitle': 'episode.fr.srt'})
 
     def test_batch_independent_success_and_failure_summary(self):
         video, args, cache = fixture(self.directory)
@@ -343,16 +349,17 @@ class RunnerTests(unittest.TestCase):
         pool = self.pool()
         with patch.object(t, 'RequestPool', return_value=pool):
             code = t.main([str(video), str(missing), '--project', 'test-project',
-                           '--model', 'test-transcribe', '--cache-dir', str(args.cache_dir)])
+                           '--model', 'test-transcribe', '--output-language', 'en', '--cache-dir', str(args.cache_dir)])
         self.assertEqual(code, 1)
         summary = t.read_json(args.cache_dir / 'summary.json')
-        self.assertEqual(summary['counts'], {'completed': 1, 'skipped': 0, 'failed': 1})
-        self.assertTrue(video.with_suffix('.source.srt').exists())
+        self.assertEqual(summary['counts'], {'completed': 1, 'skipped': 0, 'needs_language': 0, 'failed': 1})
+        self.assertTrue(video.with_suffix('.en.srt').exists())
         self.assertNotIn('test-project', (args.cache_dir / 'summary.json').read_text())
 
     def test_main_completed_skip_without_project_or_auth(self):
         video = self.directory / 'reviewed.wav'
-        video.with_suffix('.source.srt').write_text('1\n00:00:00,100 --> 00:00:01,000\nReviewed.\n')
+        video.with_suffix('.en.srt').write_text('1\n00:00:00,100 --> 00:00:01,000\nReviewed.\n')
+        t.atomic_json(t.metadata_path(video), {'original_language': 'en', 'original_subtitle': 'reviewed.en.srt'})
         with patch.object(t, 'select_project', side_effect=AssertionError('project resolution called')), \
              patch.object(t.RequestPool, 'token', side_effect=AssertionError('auth called')):
             code = t.main([str(video), '--cache-dir', str(self.directory / 'cache')])
@@ -531,7 +538,7 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('private-sentinel', printed.getvalue())
         for path in cache.glob('*.json'):
             self.assertNotIn('private-sentinel', path.read_text())
-        self.assertFalse(video.with_suffix('.source.srt').exists())
+        self.assertFalse(video.with_suffix('.en.srt').exists())
 
     def test_rejection_counts_persist_across_resume(self):
         def fail(*_):
@@ -568,6 +575,139 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(pool._token)
         self.assertNotIn('private-sentinel', str(caught.exception))
         self.assertEqual(t.read_json(path.with_suffix('.requests.json'))['retries'], 0)
+
+    def test_unknown_language_main_status_exit_and_no_srt(self):
+        video, args, cache = fixture(self.directory)
+        pool = self.pool()
+        with patch.object(t, 'RequestPool', return_value=pool), contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = t.main([str(video), '--project', 'test-project', '--model', 'test-transcribe',
+                           '--cache-dir', str(args.cache_dir)])
+        self.assertEqual(code, 2)
+        summary = t.read_json(args.cache_dir / 'summary.json')
+        result = summary['results'][0]
+        self.assertEqual(summary['counts']['needs_language'], 1)
+        self.assertIsNone(result['output'])
+        self.assertIsNone(result['original_language'])
+        self.assertEqual(result['status'], 'needs_language')
+        self.assertIn('--format-only --output-language TAG', printed.getvalue())
+        self.assertTrue((cache / 'words.json').exists())
+        self.assertTrue((cache / 'cues.json').exists())
+        self.assertEqual(list(self.directory.rglob('*.srt')), [])
+        self.assertFalse(t.metadata_path(video).exists())
+
+    def test_tagged_publication_metadata_and_no_validation_duplicates(self):
+        video, args, cache = fixture(self.directory)
+        result = t.process_episode(video, args, self.pool())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['original_language'], 'en')
+        self.assertEqual(t.read_metadata(video), {'original_language': 'en', 'original_subtitle': 'episode.en.srt'})
+        text = t.metadata_path(video).read_text()
+        self.assertIn('\n  "original_language": "en",\n', text)
+        self.assertNotIn('test-project', text)
+        self.assertNotIn('offline-token', text)
+        self.assertEqual(list(cache.rglob('*.srt')), [])
+        self.assertEqual([path.name for path in self.directory.glob('*.srt')], ['episode.en.srt'])
+
+    def test_metadata_default_rerun_preserves_reviewed_text_without_auth(self):
+        video, args, cache = fixture(self.directory)
+        self.assertEqual(t.process_episode(video, args, self.pool())['status'], 'completed')
+        subtitle = video.with_suffix('.en.srt')
+        reviewed = '1\n00:00:00,100 --> 00:00:01,000\nManually corrected subtitle.\n'
+        subtitle.write_text(reviewed)
+        args.output_language, args.model = None, 'auto'
+        pool = self.pool()
+        with patch.object(pool, 'token', side_effect=AssertionError('auth called')), \
+             patch.object(t, 'prepare_audio', side_effect=AssertionError('extraction called')):
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(result['original_language'], 'en')
+        self.assertEqual(result['output'], str(subtitle.resolve()))
+        self.assertEqual(subtitle.read_text(), reviewed)
+
+    def test_known_existing_skip_creates_metadata_and_preserves_extra_fields(self):
+        video = self.directory / 'already.wav'
+        output = video.with_suffix('.en.srt')
+        output.write_text('1\n00:00:00,100 --> 00:00:01,000\nReviewed.\n')
+        t.atomic_json(t.metadata_path(video), {'notes': ['retain this'], 'translations': {'fr': 'already.fr.srt'}})
+        with patch.object(t.RequestPool, 'token', side_effect=AssertionError('auth called')):
+            result = t.process_episode(video, args_for(video, self.directory), self.pool())
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(t.read_metadata(video), {'notes': ['retain this'], 'translations': {'fr': 'already.fr.srt'},
+            'original_language': 'en', 'original_subtitle': 'already.en.srt'})
+
+    def test_malformed_metadata_fails_before_auth_and_paid_requests(self):
+        video = self.directory / 'malformed.wav'
+        args = args_for(video, self.directory)
+        for text in ('{not json}', '// JSON5 comment\n{}', '[]', '{"original_language":"bad/tag"}',
+                     '{"original_language":"en","original_subtitle":"../outside.en.srt"}',
+                     '{"nested":1e999}', '{"original_language":"und"}'):
+            t.metadata_path(video).write_text(text)
+            pool = self.pool()
+            with patch.object(pool, 'token', side_effect=AssertionError('auth called')):
+                result = t.process_episode(video, args, pool)
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('Malformed subtitle metadata', result['error'])
+            self.assertEqual(t.metadata_path(video).read_text(), text)
+        with patch.object(t, 'select_project', side_effect=AssertionError('project resolution called')), \
+             patch.object(t, 'RequestPool', side_effect=AssertionError('pool initialized')):
+            with self.assertRaises(t.SubtitleError):
+                t.main([str(video), '--output-language', 'en'])
+
+    def test_language_hint_fallback_and_output_tag_precedence(self):
+        video = self.directory / 'language.wav'
+        args = args_for(video, self.directory, '--language', 'fr-FR')
+        args.output_language = None
+        output, language = t.publication(video, args)
+        self.assertEqual((output.name, language), ('language.fr-FR.srt', 'fr-FR'))
+        args.output_language = 'fr'
+        output, language = t.publication(video, args)
+        self.assertEqual((output.name, language), ('language.fr.srt', 'fr'))
+
+    def test_unknown_custom_output_does_not_claim_filename_language(self):
+        video, args, cache = fixture(self.directory)
+        args.output_language = None
+        args.output = self.directory / 'chosen.ja.srt'
+        result = t.process_episode(video, args, self.pool())
+        self.assertEqual(result['status'], 'completed')
+        self.assertTrue(args.output.exists())
+        self.assertIsNone(result['original_language'])
+        self.assertEqual(t.read_metadata(video), {'original_language': None, 'original_subtitle': 'chosen.ja.srt'})
+
+    def test_metadata_does_not_follow_custom_external_path(self):
+        video, args, cache = fixture(self.directory)
+        external = self.directory / 'external' / 'chosen.en.srt'
+        args.output = external
+        result = t.process_episode(video, args, self.pool())
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(t.read_metadata(video)['original_subtitle'], 'chosen.en.srt')
+        metadata = t.read_metadata(video)
+        metadata['original_subtitle_path'] = '../external/chosen.en.srt'
+        t.atomic_json(t.metadata_path(video), metadata)
+        args.output, args.output_language = None, None
+        self.assertEqual(t.destination(video, args), video.with_suffix('.en.srt'))
+        self.assertFalse(video.with_suffix('.en.srt').exists())
+
+    def test_unlabelled_source_output_forbidden_before_auth(self):
+        video = self.directory / 'episode.wav'
+        args = args_for(video, self.directory, '--output', str(video.with_suffix('.source.srt')))
+        with patch.object(t.RequestPool, 'token', side_effect=AssertionError('auth called')):
+            result = t.process_episode(video, args, self.pool())
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('drafts are not supported', result['error'])
+        self.assertFalse(video.with_suffix('.source.srt').exists())
+
+    def test_metadata_basename_cannot_follow_external_symlink(self):
+        video = self.directory / 'episode.wav'
+        external = self.directory / 'external' / 'reviewed.en.srt'
+        external.parent.mkdir()
+        external.write_text('1\n00:00:00,100 --> 00:00:01,000\nReviewed.\n')
+        target = video.with_suffix('.en.srt')
+        target.symlink_to(external)
+        t.atomic_json(t.metadata_path(video), {'original_language': 'en', 'original_subtitle': target.name})
+        args = args_for(video, self.directory)
+        args.output_language = None
+        with self.assertRaisesRegex(t.SubtitleError, 'inside the media folder'):
+            t.destination(video, args)
 
 
 if __name__ == '__main__':

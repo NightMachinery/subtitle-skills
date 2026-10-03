@@ -774,7 +774,7 @@ def request_summary(cache):
 
 
 def empty_result(video, output, configuration):
-    return {'source_name': video.name, 'output': str(output), 'status': 'failed',
+    return {'source_name': video.name, 'output': str(output) if output else None, 'status': 'failed',
             'model': configuration['model'], 'settings': configuration,
             'cue_count': 0, 'word_count': 0, 'corrections': [], 'review_flags': [],
             'usage': usage_summary([]), 'requests': request_summary(None)}
@@ -804,20 +804,87 @@ def resolved_configuration(video, args, pool, root):
     return configuration
 
 
+def valid_language_tag(value):
+    return isinstance(value, str) and value.lower() not in {'auto', 'source', 'unknown', 'und'} and bool(
+        re.fullmatch(r'[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*', value))
+
+
+def metadata_path(video):
+    return Path(video).with_suffix('.subtitles.json5')
+
+
+def read_metadata(video):
+    """Metadata uses strict JSON syntax, a JSON5 subset with no dependency."""
+    path = metadata_path(video)
+    if not path.exists():
+        return {}
+    try:
+        def reject_constant(_):
+            raise ValueError('Non-finite metadata value')
+        data = json.loads(path.read_text(encoding='utf-8'), parse_constant=reject_constant)
+        json.dumps(data, allow_nan=False)  # Also reject overflowing numeric literals in nested fields.
+        if not isinstance(data, dict):
+            raise ValueError('Expected metadata object')
+        language = data.get('original_language')
+        if language is not None and not valid_language_tag(language):
+            raise ValueError('Invalid native language')
+        name = data.get('original_subtitle')
+        if name is not None and (not isinstance(name, str) or not re.fullmatch(r'[^\x00-\x1f/\\]+\.srt', name)
+                                 or name.lower() == 'source.srt' or name.lower().endswith('.source.srt')):
+            raise ValueError('Expected subtitle basename')
+        return data
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise SubtitleError('Malformed subtitle metadata; use a JSON object with a native language tag and subtitle basename') from None
+
+
+def publication(video, args, metadata=None):
+    """Choose a native target without guessing language or following external paths."""
+    metadata = read_metadata(video) if metadata is None else metadata
+    language = args.output_language or (args.language if args.language != 'auto' else None) or metadata.get('original_language')
+    if language is not None and not valid_language_tag(language):
+        raise SubtitleError('Native language must be a confirmed, safe BCP47 language tag')
+    if args.output:
+        output = args.output
+    elif language:
+        output = Path(video).with_suffix('.' + language + '.srt')
+        name = metadata.get('original_subtitle')
+        if metadata.get('original_language') == language and name:
+            candidate = Path(video).parent / name
+            if candidate.exists():
+                output = candidate
+    else:
+        output = None
+    if output and not args.output and output.resolve().parent != Path(video).resolve().parent:
+        raise SubtitleError('Default native subtitle target must remain inside the media folder')
+    if output and (output.name.lower() == 'source.srt' or output.name.lower().endswith('.source.srt')):
+        raise SubtitleError('Unlabelled source subtitle drafts are not supported')
+    return output, language
+
+
 def destination(video, args):
-    return args.output or Path(video).with_suffix('.' + (args.output_language or 'source') + '.srt')
+    return publication(video, args)[0]
+
+
+def write_metadata(video, output, language):
+    # Re-read before updating so unrelated fields added during transcription survive.
+    metadata = read_metadata(video)
+    metadata.update(original_language=language, original_subtitle=output.name)
+    atomic_json(metadata_path(video), metadata)
 
 
 def process_episode(video, args, pool):
     video = Path(video).resolve()
-    output = destination(video, args).resolve()
+    output = None
     configuration = settings(args)
     result = empty_result(video, output, configuration)
     root, cache = source_root(video, args.cache_dir), None
     try:
         with source_lock(root):
             try:
-                if output.exists() and not args.overwrite:
+                output, language = publication(video, args)
+                output = output.resolve() if output else None
+                result.update(output=str(output) if output else None, original_language=language)
+                if output and output.exists() and not args.overwrite:
                     if not valid_srt(output):
                         raise SubtitleError('Subtitle destination exists but is invalid; use --overwrite only after review')
                     output_digest = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -828,6 +895,9 @@ def process_episode(video, args, pool):
                     else:
                         result.update(cue_count=len(re.split(r'\n\s*\n', output.read_text().strip())), word_count=None)
                     result.update(status='skipped', reason='existing_valid_srt', output_sha256=output_digest)
+                    result.update(output=str(output), original_language=language)
+                    write_metadata(video, output, language)
+                    result['metadata'] = str(metadata_path(video))
                     atomic_json(root / 'result.json', result)
                     return result
                 if not video.is_file():
@@ -887,33 +957,42 @@ def process_episode(video, args, pool):
                 cues = make_cues(words, duration)
                 result['review_flags'].extend(validate_cues(cues, words, duration))
                 atomic_json(cache / 'cues.json', cues)
-                text = render_srt(cues)
-                # Validate the actual serialization before publishing final output.
-                check = cache / 'validated.srt'
-                atomic_bytes(check, text.encode('utf-8'))
-                if not valid_srt(check):
-                    raise SubtitleError('Serialized subtitle failed structural validation')
-                command(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', str(check)])
-                output.parent.mkdir(parents=True, exist_ok=True)
-                if args.overwrite:
-                    atomic_bytes(output, text.encode('utf-8'))
+                result['cue_count'] = len(cues)
+                if output is None:
+                    result.update(status='needs_language', instruction=(
+                        'Inspect words.json in the reported cache to confirm the spoken language, then repeat '
+                        'the same model/language settings with --format-only --output-language TAG.'))
                 else:
-                    # Hard-link a complete file from a temporary on the destination
-                    # filesystem, so another process cannot cause an overwrite race.
-                    fd, temporary = tempfile.mkstemp(prefix='.' + output.name + '-', dir=output.parent)
-                    try:
-                        with os.fdopen(fd, 'wb') as handle:
-                            handle.write(text.encode('utf-8'))
-                            handle.flush()
-                            os.fsync(handle.fileno())
+                    text = render_srt(cues)
+                    # SRT serialization exists only during validation and in the
+                    # chosen final output. Timed words/cues remain the checkpoints.
+                    with tempfile.TemporaryDirectory(prefix='subtitle-validation-', dir=cache) as temporary:
+                        check = Path(temporary) / 'subtitle.srt'
+                        check.write_text(text, encoding='utf-8')
+                        if not valid_srt(check):
+                            raise SubtitleError('Serialized subtitle failed structural validation')
+                        command(['ffprobe', '-v', 'error', '-show_streams', '-of', 'json', str(check)])
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    if args.overwrite:
+                        atomic_bytes(output, text.encode('utf-8'))
+                    else:
+                        # Hard-link a complete file from a temporary on the destination
+                        # filesystem, so another process cannot cause an overwrite race.
+                        fd, temporary = tempfile.mkstemp(prefix='.' + output.name + '-', dir=output.parent)
                         try:
-                            os.link(temporary, output)
-                        except FileExistsError as error:
-                            raise SubtitleError('Subtitle destination appeared during transcription; it was preserved') from error
-                    finally:
-                        os.unlink(temporary)
-                result.update(status='completed', cue_count=len(cues),
-                              output_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest())
+                            with os.fdopen(fd, 'wb') as handle:
+                                handle.write(text.encode('utf-8'))
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            try:
+                                os.link(temporary, output)
+                            except FileExistsError as error:
+                                raise SubtitleError('Subtitle destination appeared during transcription; it was preserved') from error
+                        finally:
+                            os.unlink(temporary)
+                    write_metadata(video, output, language)
+                    result.update(status='completed', metadata=str(metadata_path(video)),
+                                  output_sha256=hashlib.sha256(text.encode('utf-8')).hexdigest())
             except Exception as error:
                 result['error'] = str(error) if isinstance(error, SubtitleError) else 'Unexpected local processing failure'
             # Failed episodes include every saved response, including responses that
@@ -943,7 +1022,7 @@ def parser():
     result.add_argument('--model', default=DEFAULT_MODEL)
     result.add_argument('--location', default='global')
     result.add_argument('--language', default='auto', help='Source language hint; auto preserves detected speech language')
-    result.add_argument('--output-language', help='Confirmed source language tag for the final filename; default: source draft')
+    result.add_argument('--output-language', help='Confirmed native language tag; otherwise use the language hint or metadata')
     result.add_argument('--gcloud', default='gcloud')
     result.add_argument('--cache-dir', type=Path)
     result.add_argument('--episode-workers', type=int, default=4)
@@ -963,20 +1042,23 @@ def main(argv=None):
         raise SubtitleError('--output requires exactly one input video')
     if not re.fullmatch(r'[a-z0-9-]+', args.location):
         raise SubtitleError('Invalid location')
-    if args.output_language and not re.fullmatch(r'[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*', args.output_language):
+    if args.output_language and not valid_language_tag(args.output_language):
         raise SubtitleError('Output language must be a safe BCP47 language tag')
+    if args.language != 'auto' and not valid_language_tag(args.language):
+        raise SubtitleError('Source language hint must be a safe BCP47 language tag')
     # Determine whether paid requests could be needed without authenticating,
     # extracting audio or creating a cache. Complete SRTs are honored first.
+    outputs = [destination(video, args) for video in args.videos]  # Validate every metadata file before any paid work.
     needs_requests = not args.format_only and any(
-        args.overwrite or not destination(video, args).exists()
-        for video in args.videos)
+        args.overwrite or output is None or not output.exists() for output in outputs)
     project = select_project(args.project, config_path=args.config) if needs_requests or args.dry_run else None
     if args.dry_run:
         jobs = []
         for video in args.videos:
-            output = destination(video, args)
+            output, language = publication(video, args)
             jobs.append({'source': str(video), 'duration_seconds': probe(video),
-                         'existing_valid_srt': output.exists() and valid_srt(output)})
+                         'output': str(output) if output else None, 'original_language': language,
+                         'existing_valid_srt': bool(output and output.exists() and valid_srt(output))})
         print(json.dumps({'project': project, 'settings': settings(args), 'jobs': jobs,
                           'episode_workers': min(args.episode_workers, len(jobs)),
                           'request_workers': args.request_workers}, indent=2))
@@ -991,14 +1073,15 @@ def main(argv=None):
             results[index] = future.result()
             result = results[index]
             print(f"{result['source_name']}: {result['status']}" +
-                  (f" ({result['error']})" if result.get('error') else ''), flush=True)
+                  (f" ({result['error']})" if result.get('error') else '') +
+                  (f" ({result['instruction']})" if result.get('instruction') else ''), flush=True)
     summary = {'results': results, 'counts': {state: sum(r['status'] == state for r in results)
-                                            for state in ('completed', 'skipped', 'failed')}}
+                                            for state in ('completed', 'skipped', 'needs_language', 'failed')}}
     bases = {args.cache_dir.resolve()} if args.cache_dir else {
         video.resolve().parent / '.subtitle-cache' for video in args.videos}
     for base in bases:
         atomic_json(base / 'summary.json', summary)
-    return 1 if summary['counts']['failed'] else 0
+    return 1 if summary['counts']['failed'] else 2 if summary['counts']['needs_language'] else 0
 
 
 if __name__ == '__main__':

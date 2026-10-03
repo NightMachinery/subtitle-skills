@@ -51,14 +51,20 @@ python3 skills/subtitle-creation/scripts/transcribe.py \
   "episode2.mp4" "episode3.mp4" --episode-workers 4 --request-workers 4
 ```
 
-This creates native transcript drafts named `.source.srt`. After the agent
-identifies the source language from the transcript, it publishes tagged native
-subtitles with a local rerender, for example:
+If the original language is not yet confirmed, this caches native words and cues
+as JSON, without writing an SRT. The agent identifies the spoken language from
+that text, then publishes the tagged original without another audio call:
+
 
 ```sh
 python3 skills/subtitle-creation/scripts/transcribe.py \
   "episode2.mp4" "episode3.mp4" --format-only --output-language en
 ```
+
+For a known native language, pass `--output-language` on the initial run.
+The runner writes only language-tagged subtitles and records the original
+language in `<media-stem>.subtitles.json5`, a pretty-printed JSON5-compatible
+sidecar. It never creates `.source.srt` drafts.
 
 The original media remain unchanged. Saved responses make interruptions
 resumable. Existing valid outputs are skipped, while `--overwrite` is explicit.
