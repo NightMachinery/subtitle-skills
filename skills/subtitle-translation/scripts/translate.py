@@ -12,7 +12,7 @@ import unicodedata
 
 TIMING = re.compile(r'^(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})$')
 DIRECTIONAL = re.compile(r'[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]')
-PROMPT = '''Translate only the supplied source subtitle cue texts into the requested target language. Return a UTF-8 JSON array of objects with exactly the keys "id" and "text", preserving every id exactly once. No timestamps, Markdown, code fences, commentary, or invented content. Use concise, faithful, idiomatic translation; preserve technical distinctions. Translate semantic text without added formatting. Preserve separate dialogue lines beginning "- " for two speakers. Preserve legitimate orthography and punctuation; do not add directional controls.'''
+PROMPT = '''Translate only the supplied source subtitle cue texts into the requested target language. Return a UTF-8 JSON array of objects with exactly the keys "id" and "text", preserving every id exactly once. No timestamps, Markdown, code fences, commentary, or invented content. Use concise, faithful, idiomatic translation; preserve technical distinctions. Keep meaning aligned with its source cue: use neighboring cues for context and grammatical flow, but avoid unnecessary clause shifts. Preserve who does or feels what; do not invent subject relationships. Translate semantic text without added formatting. Preserve separate dialogue lines beginning "- " for two speakers. Preserve legitimate orthography and punctuation; do not add directional controls.'''
 
 
 

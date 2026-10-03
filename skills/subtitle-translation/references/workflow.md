@@ -10,6 +10,8 @@ python3 scripts/translate.py prepare /path/episode.en.srt --source-language en -
 
 Preparation requires an empty work directory. It emits a manifest containing the exact source hash, cue ids, timing, language labels, numbered input JSON files, prompts, and expected response filenames. Language-specific advice loads automatically when relevant; add a language-tagged file such as `references/languages/es.md` or `pt-br.md` to extend the automatic tips. Base-language and matching regional tips load once each for the source and target. Custom advice can be supplied with `--tips /path/tips.md`.
 
+Keep each translation aligned with its own source cue as grammar allows. Neighboring cues provide context; they do not authorize moving independent claims or inventing subject relationships.
+
 Inspect the runtime model selector or available-model inventory and choose the latest available Sol family model with low reasoning effort. Respect an explicit user model selection. Do not assume a future model identifier or pin this workflow to one version. Assign each batch to a fresh-context native translator. Default concurrency is two translators, each potentially handling several batch files. The coordinator can explicitly authorize up to four. Each worker owns only its assigned response files. No recursive delegation unless the coordinator explicitly authorizes it.
 
 Use `collaboration.spawn_agent` with `fork_turns: "none"`, `reasoning_effort: "low"`, and the selected model identifier in `model`. Include this full brief, substituting actual paths and languages:
