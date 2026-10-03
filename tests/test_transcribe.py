@@ -300,6 +300,111 @@ class RunnerTests(unittest.TestCase):
         t.repair_long_words(original, [])
         self.assertEqual(original[0]['start'], 0)
 
+    def onset_words(self):
+        return [{'id': i, 'word': text, 'speaker': 'voice', 'section': 4, 'start': start, 'end': end}
+                for i, (text, start, end) in enumerate([
+                    ('Alpha', 2.0, 2.4), ('beta.', 2.4, 2.8),
+                    ('Gamma', 1.0, 4.8), ('delta.', 4.8, 5.2)])]
+
+    def test_regressed_onset_uses_measured_pause_and_raw_order_evidence(self):
+        words = self.onset_words()
+        before = [(w['id'], w['word'], w['speaker'], w['section'], w['end']) for w in words]
+        with contextlib.redirect_stdout(io.StringIO()):
+            corrections, flags = t.repair_long_words(words, [{'start': 3.8, 'end': 4.5}])
+        self.assertEqual(words[2]['start'], 4.5)
+        self.assertEqual(words[2]['original_start'], 1.0)
+        self.assertEqual(before, [(w['id'], w['word'], w['speaker'], w['section'], w['end']) for w in words])
+        evidence = corrections[0]['evidence']
+        self.assertEqual(evidence['kind'], 'same_speaker_raw_order_regression')
+        self.assertEqual(evidence['pause'], {'start': 3.8, 'end': 4.5})
+        self.assertEqual((evidence['previous_word_id'], evidence['following_word_id']), (1, 3))
+        self.assertEqual(evidence['intervening_word_ids'], [0, 1])
+        self.assertTrue(any(flag['kind'] == 'inferred_onset' and flag['evidence'] == evidence for flag in flags))
+        words.sort(key=lambda word: (word['start'], word['id']))
+        cues = t.make_cues(words, 6)
+        t.validate_cues(cues, words, 6)
+        self.assertEqual([i for cue in cues for i in cue['word_ids']], list(range(4)))
+
+    def test_two_regressed_onsets_repair_later_first_without_fixed_offset(self):
+        words = [{'id': i, 'word': text, 'speaker': 'voice', 'section': 1, 'start': start, 'end': end}
+                 for i, (text, start, end) in enumerate([
+                     ('One', 3.0, 3.3), ('two.', 3.3, 3.8), ('Three', 1.7, 6.1),
+                     ('four', 6.1, 6.6), ('five.', 6.6, 7.1),
+                     ('Six', 2.8, 9.4), ('seven.', 9.4, 10.0)])]
+        words.sort(key=lambda word: (word['start'], word['id']))
+        before = {word['id']: (word['word'], word['end']) for word in words}
+        with contextlib.redirect_stdout(io.StringIO()):
+            corrections, flags = t.repair_long_words(words, [{'start': 5.4, 'end': 5.85},
+                                                           {'start': 8.7, 'end': 9.05}])
+        self.assertEqual([value['word_id'] for value in corrections], [2, 5])
+        self.assertEqual([value['start'] for value in corrections], [5.85, 9.05])
+        self.assertNotAlmostEqual(corrections[0]['start'] - corrections[0]['original_start'],
+                                  corrections[1]['start'] - corrections[1]['original_start'])
+        self.assertEqual(before, {word['id']: (word['word'], word['end']) for word in words})
+        self.assertEqual(sum(flag['kind'] == 'inferred_onset' for flag in flags), 2)
+        words.sort(key=lambda word: (word['start'], word['id']))
+        t.validate_cues(t.make_cues(words, 11), words, 11)
+        self.assertEqual([word['id'] for word in words], list(range(7)))
+
+    def test_regression_repair_rejects_other_speaker_or_section(self):
+        for changed in ({'speaker': 'different'}, {'section': 9}):
+            with self.subTest(changed=changed):
+                words = self.onset_words()
+                # The immediate previous/following neighbors still share the
+                # track. An earlier intervening word is the conflicting voice.
+                words[0].update(changed)
+                corrections, flags = t.repair_long_words(words, [{'start': 3.8, 'end': 4.5}])
+                self.assertEqual(corrections, [])
+                self.assertEqual(words[2]['start'], 1.0)
+                self.assertFalse(any(flag['kind'] == 'inferred_onset' for flag in flags))
+
+    def test_regression_repair_rejects_credible_following_overlap_or_unfinished_word(self):
+        for change in ('following', 'unfinished'):
+            with self.subTest(change=change):
+                words = self.onset_words()
+                if change == 'following':
+                    words[3].update(start=3.2, end=3.5)
+                else:
+                    words[0]['end'] = 4.7
+                corrections, _ = t.repair_long_words(words, [{'start': 3.8, 'end': 4.5}])
+                self.assertEqual(corrections, [])
+                self.assertEqual(words[2]['start'], 1.0)
+
+    def test_repair_does_not_ignore_overlap_starting_before_anomalous_start(self):
+        words = self.onset_words()
+        words[0].update(start=0.5, end=2.4, speaker='different')
+        corrections, _ = t.repair_long_words(words, [{'start': 3.8, 'end': 4.5}])
+        self.assertEqual(corrections, [])
+        self.assertEqual(words[2]['start'], 1.0)
+
+    def test_repair_does_not_ignore_following_raw_word_before_anomalous_start(self):
+        words = self.onset_words()
+        words[3].update(start=0.4, end=0.7)
+        corrections, _ = t.repair_long_words(words, [{'start': 3.8, 'end': 4.5}])
+        self.assertEqual(corrections, [])
+        self.assertEqual(words[2]['start'], 1.0)
+
+    def test_regression_repair_requires_pause_section_unique_ids_and_backwards_sequence(self):
+        for missing in ('pause', 'section', 'unique_ids', 'regression'):
+            with self.subTest(missing=missing):
+                words = self.onset_words()
+                pauses = [{'start': 3.8, 'end': 4.5}]
+                if missing == 'pause':
+                    pauses = []
+                elif missing == 'section':
+                    for word in words:
+                        word.pop('section')
+                elif missing == 'unique_ids':
+                    words[0]['id'] = words[1]['id']
+                else:
+                    words[2].update(start=3.0, end=6.0)
+                    words[3].update(start=3.5, end=3.8)
+                    pauses = [{'start': 4.6, 'end': 5.4}]
+                original = words[2]['start']
+                corrections, _ = t.repair_long_words(words, pauses)
+                self.assertEqual(corrections, [])
+                self.assertEqual(words[2]['start'], original)
+
     def test_usage_actual_modality(self):
         usage = t.usage_summary([response()])
         self.assertEqual((usage['input_audio_tokens'], usage['input_text_tokens'], usage['output_text_tokens']), (321, 1, 40))

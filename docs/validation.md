@@ -24,3 +24,16 @@ without creating an inflight marker or attempt audit.
 A cached-response integration test exercises the real transcription formatter
 and language-labeling handoff without authentication or paid calls. See the
 [queue contract](batch.md) for private manifests and review decisions.
+
+Long-word onset repair uses measured silence endpoints, never a guessed time
+shift. A conservative raw-order exception handles starts that regress behind
+the same speaker's previous word within one section. It requires supported
+previous/following bounds and proves every apparently intervening interval is
+an earlier word from that same speaker and section, ending before the proposed
+onset. Later anomalies are evaluated first; unrepaired following speech,
+conflicting speakers/sections, missing sequence evidence, or absent measured
+pauses block correction. Every inferred onset retains its original start,
+measured-pause and sequence evidence, and a review flag. Word text, IDs,
+speaker labels, endpoints and transcription/cache identity stay unchanged.
+Apply this offline through existing cached responses and preserve reviewed SRTs;
+representative audio review remains necessary for inferred timing.

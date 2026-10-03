@@ -642,24 +642,62 @@ def repair_long_words(words, silences):
         interval = word['end'] - word['start']
         if interval < 0.04 or interval > 2:
             flags.append({'kind': 'implausible_word_interval', 'word_id': word['id'], 'seconds': interval})
-        if interval <= 2:
+    # IDs retain raw transcript order even after callers sort by timestamp.
+    # Work backwards so a later supported regression stops masquerading as
+    # genuinely intervening speech during an earlier word's repair.
+    raw_order = sorted(words, key=lambda word: word['id'])
+    raw_ids = [word['id'] for word in raw_order]
+    sequence_valid = (all(type(value) is int for value in raw_ids)
+                      and len(set(raw_ids)) == len(raw_ids))
+    positions = {word['id']: index for index, word in enumerate(raw_order)}
+    for word in reversed(raw_order):
+        if word['end'] - word['start'] <= 2:
             continue
         pauses = [pause for pause in silences if pause['end'] - pause['start'] >= 0.35
                   and word['start'] <= pause['start'] < pause['end'] < word['end']
                   and 0.04 <= word['end'] - pause['end'] <= 1.5]
-        # Do not infer an onset through another word's already measured speech.
-        if pauses:
-            onset = max(pause['end'] for pause in pauses)
-            if any(other['id'] != word['id'] and word['start'] < other['start'] < onset for other in words):
+        if not pauses:
+            continue
+        pause = max(pauses, key=lambda value: value['end'])
+        onset = pause['end']
+        blockers = [other for other in words if other['id'] != word['id']
+                    and (word['start'] < other['start'] < onset
+                         or other['start'] <= word['start'] < other['end']
+                         or (sequence_valid and other['id'] > word['id'] and other['start'] < onset))]
+        evidence = {'kind': 'measured_silence', 'pause': dict(pause)}
+        # Ordinarily, never infer through another word's measured speech.
+        # The narrow exception requires raw-order regression, same-speaker
+        # neighbors and all intersecting intervals ending before this onset.
+        if blockers:
+            index = positions[word['id']]
+            if not sequence_valid or word.get('section') is None or not 0 < index < len(raw_order) - 1:
                 continue
-            word['original_start'] = word['start']
-            word['start'] = onset
-            word['timing_note'] = 'Start adjusted to measured silence end; review inferred onset.'
-            correction = {'kind': 'measured_pause_onset', 'word_id': word['id'],
-                          'original_start': word['original_start'], 'start': onset}
-            corrections.append(correction)
-            print(f"Timing correction for word {word['id']}: {word['original_start']:.3f}s to {onset:.3f}s", flush=True)
-    return corrections, flags
+            previous, following = raw_order[index - 1], raw_order[index + 1]
+            same_track = lambda other: (other.get('section') == word['section']
+                                        and other['speaker'] == word['speaker'])
+            if (not same_track(previous) or not same_track(following)
+                    or not word['start'] < previous['end'] <= onset <= following['start']):
+                continue
+            intervening = [other for other in words if other['id'] != word['id']
+                           and other['start'] < onset
+                           and (other['end'] > word['start'] or other in blockers)]
+            if any(other['id'] >= word['id'] or not same_track(other) or other['end'] > onset
+                   for other in intervening):
+                continue
+            evidence.update(kind='same_speaker_raw_order_regression',
+                            previous_word_id=previous['id'], previous_end=previous['end'],
+                            following_word_id=following['id'], following_start=following['start'],
+                            intervening_word_ids=[other['id'] for other in intervening])
+        word['original_start'] = word['start']
+        word['start'] = onset
+        word['timing_note'] = 'Start adjusted to measured silence end; review inferred onset.'
+        correction = {'kind': 'measured_pause_onset', 'word_id': word['id'],
+                      'original_start': word['original_start'], 'start': onset, 'evidence': evidence}
+        corrections.append(correction)
+        flags.append({'kind': 'inferred_onset', 'word_id': word['id'],
+                      'original_start': word['original_start'], 'start': onset, 'evidence': evidence})
+        print(f"Timing correction for word {word['id']}: {word['original_start']:.3f}s to {onset:.3f}s", flush=True)
+    return sorted(corrections, key=lambda value: value['word_id']), flags
 
 
 def validate_cues(cues, words, duration):
