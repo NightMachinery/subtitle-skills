@@ -133,8 +133,13 @@ Workers must not edit the skill, commit files, or process unassigned episodes.
 ## Reviewed priority waves
 
 For ordered multi-series work, use the bundled `scripts/batch.py` with an
-explicit private manifest and `--state-dir`. It processes serial episodes with
-one shared request pool (default one request worker), emits per-group review
+explicit private manifest and `--state-dir`. For authorized directory inventory,
+use `scripts/manage.py plan`; for packet preparation, cached labeling and explicit
+review decision publication, use its `packet`, `label` and `accept` commands.
+Read [assigned review guidance](references/batch-review.md) for that workflow.
+
+The queue processes serial episodes with one shared request pool (default one
+request worker), emits per-group review
 requests, and waits until every job in a wave has valid native/required English
 subtitles and accepted review decisions before starting the next wave. Agents
 confirm language, publish cached native subtitles with `--format-only`, translate

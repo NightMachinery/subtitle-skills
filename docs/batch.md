@@ -135,3 +135,56 @@ not replay notifications on resume. A failed notification records a sanitized
 `notify_failed` event without invalidating cached transcription. Use an external
 recovery heartbeat when notifications can be missed; the queue itself never
 launches agent workers.
+
+## Offline setup and review helper
+
+`skills/subtitle-creation/scripts/manage.py` consolidates inventory and review
+bookkeeping. Its commands never authenticate or call transcription APIs:
+
+```sh
+python3 skills/subtitle-creation/scripts/manage.py plan \
+  --root "$MEDIA_DIR" --state-dir "$PRIVATE_STATE" --wave-size 4
+python3 skills/subtitle-creation/scripts/manage.py packet \
+  --request "$REVIEW_REQUEST" --work-dir "$EMPTY_PRIVATE_WORK"
+python3 skills/subtitle-creation/scripts/manage.py label \
+  --request "$REVIEW_REQUEST" --job "$JOB_ID" --language "$ACTUAL_BCP47"
+python3 skills/subtitle-creation/scripts/manage.py accept \
+  --request "$REVIEW_REQUEST" --notes "$REVIEWER_NOTES"
+```
+
+`plan` inventories only the explicitly authorized root. It discovers common
+audio/video extensions, skips hidden/cache directories and directory symlinks,
+and records outside-root file symlinks and no-audio files as skipped. ffprobe
+provides duration/audio checks. Series groups follow source parent folders;
+filenames accept bare episode numbers, episode/lecture/lesson prefixes, and a
+leading numeric course ID of at least four digits. `--episode-pattern` overrides
+this using a named `episode` integer capture. Ambiguous/unparsed names and
+duplicate episode/output ownership halt with private inventory evidence.
+Numbered wave slots use episode indices (1 through wave-size first); episode
+zero extras follow all numbered waves. No paid scope is created by inventory.
+
+The private state contains `inventory.json` and `manifest.json` using the
+existing queue schema above. Start batch.py with that manifest and state.
+`accepted_existing` defaults false; change it explicitly only for known prior
+review before starting the queue. Existing metadata and subtitles are inventoried
+and preserved. An existing plan/state is reusable only with matching content
+and queue identity. Changed plans require a deliberately new private state.
+
+The review commands expect the planner's `manifest.json` beside queue-state and
+review requests, or accept `--manifest` for an existing externally located
+explicit manifest. They check canonical queue/request identity, source hashes and
+protected outputs. `packet` requires an empty private work directory, recovers
+original cache flags behind an existing-native skip summary, and includes bounded
+representative samples plus complete flags/corrections and current output hashes.
+Multiple unselected transcript caches require resolution rather than guessing.
+`label` requires cached transcription and a reviewer-selected language; it
+protects existing original/translation files. `accept` requires explicit
+reviewer-authored notes, validates current final files/timelines and publishes
+only a review decision. Assigned-job checks permit unrelated episodes to remain
+in flight during review. Existing different artifacts are never overwritten;
+identical decisions may be reused. Private destination checks resolve symlinks
+and reject paths within this public skill repository.
+
+Read [assigned review guidance](../skills/subtitle-creation/references/batch-review.md)
+for native language evidence, translation, bounded audio rechecks, reviewer note
+coverage and output preservation. Packet generation does not perform review.
