@@ -148,6 +148,14 @@ do not fabricate wording or timing to conceal them.
 
 Read representative opening, middle/dialogue, and ending cues for each episode.
 Checks establish structural validity, not perfect transcription or translation.
+If review finds garbled wording or a possible meaning-changing omission, recheck
+one short audio clip with surrounding context, preserving both the original and
+new raw responses. The runner can process an extracted clip as standalone media.
+Do not infer missing words from plausibility alone. Apply only audio-supported
+wording corrections, record their provenance privately, and update the affected
+translations. Invalid recheck timestamps do not justify replacing valid original
+cue timing. Keep corrected outputs when resuming; a raw-cache rerender can undo
+manual wording corrections.
 Report created original/translated paths, skipped/failed episodes, and material
 review flags. If cost is requested, use the returned usage counters and current
 official Vertex prices, include successful retries/tests, and label it an
