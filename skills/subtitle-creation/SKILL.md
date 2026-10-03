@@ -130,6 +130,20 @@ Honor an explicitly requested agent model/effort. Keep prompts fresh and limited
 to the skill, assigned media, output ownership, and selected configuration.
 Workers must not edit the skill, commit files, or process unassigned episodes.
 
+## Reviewed priority waves
+
+For ordered multi-series work, use the bundled `scripts/batch.py` with an
+explicit private manifest and `--state-dir`. It processes serial episodes with
+one shared request pool (default one request worker), emits per-group review
+requests, and waits until every job in a wave has valid native/required English
+subtitles and accepted review decisions before starting the next wave. Agents
+confirm language, publish cached native subtitles with `--format-only`, translate
+when needed, and record final-file hashes plus representative review provenance.
+Existing subtitles stay protected. Resume the same state rather than launching
+independent wave processes. An optional private notification argv file wakes a
+coordinator after persisted review/failure/completion milestones. See the exact
+manifest, decision and resume contract in [queue documentation](../../docs/batch.md).
+
 ## Translation
 
 After original-language subtitles succeed, invoke **subtitle-translation**, bundled alongside this

@@ -77,6 +77,12 @@ shares that request budget across episodes. If using parallel subagents, divide
 the requested media among at most four workers and give each
 `--request-workers 1`; do not multiply the request limit accidentally.
 
+For work that must finish one priority wave before another, use the bundled
+`skills/subtitle-creation/scripts/batch.py`. It shares one request pool across
+serial episodes and requires agent review decisions before advancing. Keep its
+manifest, state, review files and optional notification command outside this
+public repository. See [the queue contract](docs/batch.md).
+
 ## Validation
 
 Run the offline tests from the repository root:
@@ -85,6 +91,7 @@ Run the offline tests from the repository root:
 python3 -B tests/test_transcribe.py
 python3 -B tests/test_translate.py
 python3 -B tests/test_models.py
+python3 -B tests/test_batch.py
 ```
 
 The tests exercise source locks, resumability, bounded retries, model selection,

@@ -13,3 +13,14 @@ The forward test also found false dialogue markers where two independently diari
 A narrow audio recheck can resolve wording while returning unusable word timestamps. Preserve its raw response and the original timings, record supported lexical corrections outside the repository, and regenerate only affected translations. If a recheck does not confirm a suspected omission, flag the source instead of guessing. Structural validation alone cannot establish semantic accuracy.
 
 Only native language-tagged SRTs should be stored. If the native language is unknown, keep words/cues as JSON and finish labeling before SRT publication. The pretty-printed `.subtitles.json5` sidecar records the original language; it contains no cloud configuration. Test default reruns against that metadata without authentication or duplicate audio calls.
+
+The priority-wave queue tests cover stable wave/group ordering, review barriers,
+shared request pools, exact subtitle/source identities, protected existing files,
+interrupted and format-only resumes, native/English timeline validation, locks,
+sticky failures, literal bracket-filename protection, and notification persistence
+ordering without shell execution. A real request-pool test receives a failed
+review after one chunk, preserves that response, and prevents a second request
+without creating an inflight marker or attempt audit.
+A cached-response integration test exercises the real transcription formatter
+and language-labeling handoff without authentication or paid calls. See the
+[queue contract](batch.md) for private manifests and review decisions.
