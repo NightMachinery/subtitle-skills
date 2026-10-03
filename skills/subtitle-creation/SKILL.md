@@ -96,6 +96,17 @@ an explicit user instruction, pass `--output-language` on the initial command.
 For future English-only reruns, specify `--output-language en` to skip existing
 English outputs instead of recreating a native draft.
 
+Known HTTP 429 and server rejections get at most two retries, with roughly
+60/120-second exponential cooldowns and jitter. Server retry advice is honored
+up to five minutes. Queued requests share the cooldown inside one runner
+process; separate worker processes do not share it. On repeated throttling,
+resume the cached batch with one episode and request worker. Do not loop batches
+indefinitely or change billing, projects, or models to evade a rejection.
+The per-chunk `.requests.json` audits and episode `requests` summary retain
+sanitized rejection categories and attempt counts. Old responses created before
+these audits remain usable, but their historical attempt totals are unknown.
+An HTTP 429 alone does not prove a particular numerical quota was exceeded.
+
 Resume the same command and cache after an interruption. Existing valid outputs
 are skipped before authentication
 or spend. Use `--overwrite` only when replacing them was requested. Use

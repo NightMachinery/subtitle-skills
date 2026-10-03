@@ -1,5 +1,8 @@
 """Offline invariants. Run: python3 -B tests/test_transcribe.py [path/to/transcribe.py]"""
 import importlib.util
+import contextlib
+from email.utils import formatdate
+import io
 import json
 import multiprocessing
 from pathlib import Path
@@ -69,6 +72,39 @@ def counted_process(video, directory, counter, result_path):
     Path(result_path).write_text(json.dumps(result))
 
 
+class FakeClock:
+    def __init__(self):
+        self.seconds = 0.0
+        self.sleeps = []
+        self.lock = threading.Lock()
+
+    def now(self):
+        with self.lock:
+            return self.seconds
+
+    def sleep(self, seconds):
+        with self.lock:
+            self.sleeps.append(seconds)
+            self.seconds += seconds
+
+
+def rejection(status=429, retry_after=None, retry_info=None, sensitive='private-sentinel'):
+    details = [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+                'reason': 'RATE_LIMIT_EXCEEDED', 'metadata': {
+                    'quota_metric': 'aiplatform.googleapis.com/generate_content_requests',
+                    'quota_limit': 'GenerateContentRequestsPerMinutePerProjectPerBaseModel',
+                    'consumer': 'projects/' + sensitive,
+                    'project': sensitive, 'credential': sensitive}}]
+    if retry_info:
+        details.append({'@type': 'type.googleapis.com/google.rpc.RetryInfo', 'retryDelay': retry_info})
+    body = {'error': {'code': status, 'status': 'RESOURCE_EXHAUSTED',
+                     'message': 'Quota exceeded for projects/' + sensitive + ' bearer ' + sensitive,
+                     'details': details}}
+    headers = {'Retry-After': retry_after} if retry_after is not None else {}
+    return urllib.error.HTTPError('https://invalid.test/projects/' + sensitive, status,
+                                  sensitive, headers, io.BytesIO(json.dumps(body).encode()))
+
+
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='subtitle-offline-')
@@ -78,8 +114,11 @@ class RunnerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def pool(self, fake=None, workers=1):
-        pool = t.RequestPool(workers, 'test-project', request=fake or (lambda *_: response()), sleep=lambda _: None)
+        clock = FakeClock()
+        pool = t.RequestPool(workers, 'test-project', request=fake or (lambda *_: response()),
+                             sleep=clock.sleep, clock=clock.now, random=lambda: 0)
         pool._token = 'offline-token'
+        pool.test_clock = clock
         return pool
 
     def test_project_precedence_private_toml_and_no_hostname(self):
@@ -346,6 +385,178 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(preparation['chunks'], [{'index': 0, 'start': 0.0, 'end': 10.0}])
         with wave.open(str(cache / 'audio.wav'), 'rb') as audio:
             self.assertEqual((audio.getnchannels(), audio.getframerate()), (1, 16000))
+
+    def test_retry_backoff_60_then_120_with_positive_jitter(self):
+        times = []
+        def fail(*_):
+            times.append(pool.test_clock.now())
+            raise rejection()
+        pool = self.pool(fail)
+        pool.random = lambda: 0.5
+        path = self.directory / 'chunk-000.json'
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(t.SubtitleError):
+            pool.transcribe(b'offline', path, 10, t.settings(t.parser().parse_args(['episode.wav'])))
+        self.assertEqual(times, [0, 66, 198])
+        audit = t.read_json(path.with_suffix('.requests.json'))
+        self.assertEqual((audit['attempts'], audit['rejections'], audit['retries']), (3, 3, 2))
+        self.assertFalse(path.with_suffix('.inflight.json').exists())
+        self.assertEqual(audit['diagnostics'][0]['category'], 'request_quota')
+
+    def test_retry_after_and_retry_info_larger_delay_wins(self):
+        times = []
+        def fake(*_):
+            times.append(pool.test_clock.now())
+            if len(times) == 1:
+                raise rejection(retry_after='150', retry_info='180.5s')
+            return response()
+        pool = self.pool(fake)
+        path = self.directory / 'chunk-000.json'
+        with contextlib.redirect_stdout(io.StringIO()):
+            pool.transcribe(b'offline', path, 10, t.settings(t.parser().parse_args(['episode.wav'])))
+        self.assertEqual(times, [0, 180.5])
+        self.assertEqual(t.read_json(path.with_suffix('.requests.json'))['last_outcome'], 'succeeded')
+
+    def test_retry_after_http_date_cap_and_malformed_values(self):
+        for header, expected in [(formatdate(180, usegmt=True), 180), ('99999', 300), ('NaN', None),
+                                  ('120; Bearer private-sentinel', None)]:
+            error = rejection(retry_after=header)
+            try:
+                diagnostic = t.http_diagnostic(error, wall_clock=lambda: 0)
+            finally:
+                error.close()
+            self.assertEqual(diagnostic.get('retry_after_seconds'), expected)
+            self.assertNotIn('private-sentinel', json.dumps(diagnostic))
+
+    def test_shared_cooldown_gates_queued_first_requests(self):
+        calls = []
+        first_started, let_first_reject = threading.Event(), threading.Event()
+        lock = threading.Lock()
+        def fake(*_):
+            with lock:
+                calls.append(pool.test_clock.now())
+                first = len(calls) == 1
+            if first:
+                first_started.set()
+                self.assertTrue(let_first_reject.wait(2))
+                raise rejection()
+            return response()
+        pool = self.pool(fake, 1)
+        config = t.settings(t.parser().parse_args(['episode.wav']))
+        with contextlib.redirect_stdout(io.StringIO()), ThreadPoolExecutor(max_workers=2) as workers:
+            a = workers.submit(pool.transcribe, b'offline', self.directory / 'chunk-000.json', 10, config)
+            self.assertTrue(first_started.wait(2))
+            b = workers.submit(pool.transcribe, b'offline', self.directory / 'chunk-001.json', 10, config)
+            let_first_reject.set()
+            a.result(timeout=5)
+            b.result(timeout=5)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0], 0)
+        self.assertTrue(all(time >= 60 for time in calls[1:]))
+
+    def test_shared_cooldown_extension_rechecked(self):
+        pool = self.pool()
+        first = True
+        def sleep(seconds):
+            nonlocal first
+            pool.test_clock.sleep(seconds)
+            if first:
+                first = False
+                pool.cooldown(90)
+        pool.sleep = sleep
+        pool.cooldown(60)
+        pool.wait_for_cooldown()
+        self.assertEqual(pool.test_clock.now(), 150)
+        self.assertEqual(pool.test_clock.sleeps, [60, 60, 30])
+
+    def test_diagnostics_do_not_leak_identifiers_even_in_allowed_keys(self):
+        error = rejection(sensitive='private-sentinel')
+        diagnostic = t.http_diagnostic(error)
+        error.close()
+        self.assertEqual(diagnostic['reason'], 'RATE_LIMIT_EXCEEDED')
+        self.assertEqual(diagnostic['quota_limit'], 'GenerateContentRequestsPerMinutePerProjectPerBaseModel')
+        self.assertNotIn('private-sentinel', json.dumps(diagnostic))
+        malicious = {'error': {'status': 'private-sentinel', 'message': 'private-sentinel',
+            'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo', 'reason': 'private-sentinel',
+                'metadata': {'quota_metric': 'aiplatform.googleapis.com/private-sentinel',
+                             'quota_limit': 'GenerateContentRequestsPerMinutePerProjectprivate-sentinel'}}]}}
+        error = urllib.error.HTTPError('https://invalid.test', 429, 'private-sentinel', {},
+                                       io.BytesIO(json.dumps(malicious).encode()))
+        diagnostic = t.http_diagnostic(error)
+        error.close()
+        self.assertEqual(diagnostic, {'http_status': 429, 'category': 'resource_exhausted_unspecified'})
+
+    def test_vertex_long_metric_identifies_request_quota(self):
+        body = {'error': {'details': [{'@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            'metadata': {'quota_metric': 'aiplatform.googleapis.com/generate_content_requests_per_minute_per_project_per_base_model',
+                         'consumer': 'projects/private-sentinel'}}]}}
+        error = urllib.error.HTTPError('https://invalid.test', 429, 'rejected', {},
+            io.BytesIO(json.dumps(body).encode()))
+        diagnostic = t.http_diagnostic(error)
+        error.close()
+        self.assertEqual(diagnostic['category'], 'request_quota')
+        self.assertNotIn('private-sentinel', json.dumps(diagnostic))
+
+    def test_known_message_category_and_quota_name_are_sanitized(self):
+        body = {'error': {'message': "Quota exceeded for quota metric 'aiplatform.googleapis.com/generate_content_input_tokens' "
+                         "and limit 'GenerateContentInputTokensPerDayPerProject' for consumer 'projects/private-sentinel'"}}
+        error = urllib.error.HTTPError('https://invalid.test', 429, 'private-sentinel', {},
+                                       io.BytesIO(json.dumps(body).encode()))
+        diagnostic = t.http_diagnostic(error)
+        error.close()
+        self.assertEqual(diagnostic['category'], 'daily_quota')
+        self.assertEqual(diagnostic['quota_metric'], 'aiplatform.googleapis.com/generate_content_input_tokens')
+        self.assertNotIn('private-sentinel', json.dumps(diagnostic))
+
+    def test_episode_result_aggregates_rejections_safely(self):
+        video, args, cache = fixture(self.directory)
+        def fail(*_):
+            raise rejection(sensitive='private-sentinel', retry_info='120s')
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            result = t.process_episode(video, args, self.pool(fail))
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['requests']['rejection_counts'], {'429': 3})
+        self.assertEqual(result['requests']['retries'], 2)
+        self.assertIn('request_quota', result['error'])
+        self.assertNotIn('private-sentinel', printed.getvalue())
+        for path in cache.glob('*.json'):
+            self.assertNotIn('private-sentinel', path.read_text())
+        self.assertFalse(video.with_suffix('.source.srt').exists())
+
+    def test_rejection_counts_persist_across_resume(self):
+        def fail(*_):
+            raise rejection()
+        path = self.directory / 'chunk-000.json'
+        for _ in range(2):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(t.SubtitleError):
+                self.pool(fail).transcribe(b'offline', path, 10, t.settings(t.parser().parse_args(['episode.wav'])))
+        audit = t.read_json(path.with_suffix('.requests.json'))
+        self.assertEqual((audit['attempts'], audit['rejections'], audit['retries']), (6, 6, 4))
+
+    def test_long_run_token_refresh_before_new_request(self):
+        pool = self.pool()
+        pool._token_acquired_at = pool.test_clock.now()
+        pool.test_clock.sleep(t.TOKEN_REFRESH_SECONDS)
+        class Result:
+            stdout = 'renewed-offline-token\n'
+        with patch.object(t.subprocess, 'run', return_value=Result()) as auth:
+            self.assertEqual(pool.token(), 'renewed-offline-token')
+            self.assertEqual(pool.token(), 'renewed-offline-token')
+        self.assertEqual(auth.call_count, 1)
+
+    def test_401_never_blindly_replays_audio(self):
+        calls = []
+        def reject(*_):
+            calls.append(1)
+            raise urllib.error.HTTPError('https://invalid.test', 401, 'private-sentinel', {},
+                io.BytesIO(b'{"error":{"status":"UNAUTHENTICATED","message":"private-sentinel"}}'))
+        pool = self.pool(reject)
+        path = self.directory / 'chunk-000.json'
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(t.SubtitleError) as caught:
+            pool.transcribe(b'offline', path, 10, t.settings(t.parser().parse_args(['episode.wav'])))
+        self.assertEqual(calls, [1])
+        self.assertIsNone(pool._token)
+        self.assertNotIn('private-sentinel', str(caught.exception))
+        self.assertEqual(t.read_json(path.with_suffix('.requests.json'))['retries'], 0)
 
 
 if __name__ == '__main__':

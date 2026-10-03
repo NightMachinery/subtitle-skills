@@ -8,6 +8,7 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 import io
@@ -16,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
+import random as random_module
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,32 @@ import wave
 
 DEFAULT_MODEL = 'auto'
 FORMAT_VERSION = 1
+MAX_RETRY_DELAY = 300.0
+TOKEN_REFRESH_SECONDS = 2700
+HTTP_STATUSES = {'INVALID_ARGUMENT', 'UNAUTHENTICATED', 'PERMISSION_DENIED', 'NOT_FOUND',
+                 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'ABORTED', 'OUT_OF_RANGE',
+                 'UNIMPLEMENTED', 'INTERNAL', 'UNAVAILABLE', 'DEADLINE_EXCEEDED', 'UNKNOWN'}
+HTTP_REASONS = {'RATE_LIMIT_EXCEEDED', 'QUOTA_EXCEEDED', 'RESOURCE_EXHAUSTED',
+                'SERVICE_DISABLED', 'BILLING_DISABLED', 'ACCESS_TOKEN_EXPIRED',
+                'AUTHENTICATION_ERROR', 'CREDENTIALS_MISSING', 'IAM_PERMISSION_DENIED'}
+QUOTA_METRICS = {'aiplatform.googleapis.com/' + name for name in (
+    'generate_content_requests', 'generate_content_input_tokens',
+    'generate_content_output_tokens', 'generate_content_total_tokens',
+    'generate_content_tokens', 'generate_content_audio_input_seconds',
+    'generate_content_audio_input_tokens', 'online_prediction_requests', 'publisher_model_requests',
+    'generate_content_requests_per_minute_per_project_per_base_model',
+    'generate_content_input_tokens_per_minute_per_base_model',
+    'generate_content_output_tokens_per_minute_per_base_model',
+    'generate_content_audio_input_per_base_model_id_and_resolution',
+    'generate_content_audio_input_per_base_model_id_and_resolution_global')}
+QUOTA_LIMIT_PATTERN = re.compile(
+    r'(?:GenerateContent|OnlinePrediction|PublisherModel)'
+    r'(?:Requests|InputTokens|OutputTokens|TotalTokens|Tokens|AudioInputSeconds|AudioInputTokens)'
+    r'(?:Per(?:Minute|Day|Second|Hour|Project|Region|Model|BaseModel|User|Organization|Location)){1,8}')
+QUOTA_SNAKE_LIMIT_PATTERN = re.compile(
+    r'(?:generate_content|online_prediction|publisher_model)_'
+    r'(?:requests|input_tokens|output_tokens|total_tokens|tokens|audio_input_seconds|audio_input_tokens)'
+    r'(?:_per_(?:minute|day|second|hour|project|region|model|base_model|user|organization|location)){1,8}')
 
 
 class SubtitleError(RuntimeError):
@@ -271,17 +299,161 @@ def request_json(url, payload, token):
         return json.load(response)
 
 
+def bounded_delay(value):
+    try:
+        number = float(value)
+        return min(number, MAX_RETRY_DELAY) if math.isfinite(number) and number >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def http_diagnostic(error, wall_clock=time.time):
+    """Read a bounded body in memory; return only positively allowlisted fields."""
+    diagnostic = {'http_status': error.code}
+    retry_delays = []
+    header = error.headers.get('Retry-After') if error.headers else None
+    delay = bounded_delay(header)
+    if delay is None and header:
+        try:
+            date = parsedate_to_datetime(header)
+            delay = bounded_delay(max(0, date.timestamp() - wall_clock()))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if delay is not None:
+        retry_delays.append(delay)
+    try:
+        raw = error.read(65537)
+        data = json.loads(raw) if len(raw) <= 65536 else {}
+        api = data.get('error', {}) if isinstance(data, dict) else {}
+        if not isinstance(api, dict):
+            api = {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        api = {}
+    status = api.get('status')
+    if isinstance(status, str) and status in HTTP_STATUSES:
+        diagnostic['status'] = status
+    details = api.get('details', [])
+    for detail in details if isinstance(details, list) else []:
+        if not isinstance(detail, dict):
+            continue
+        if detail.get('@type') == 'type.googleapis.com/google.rpc.RetryInfo':
+            value = detail.get('retryDelay')
+            if isinstance(value, str) and re.fullmatch(r'\d+(?:\.\d+)?s', value):
+                delay = bounded_delay(value[:-1])
+            elif isinstance(value, dict):
+                try:
+                    delay = bounded_delay(float(value.get('seconds', 0)) + float(value.get('nanos', 0)) / 1e9)
+                except (TypeError, ValueError, OverflowError):
+                    delay = None
+            else:
+                delay = None
+            if delay is not None:
+                retry_delays.append(delay)
+        if detail.get('@type') == 'type.googleapis.com/google.rpc.ErrorInfo':
+            reason = detail.get('reason')
+            if isinstance(reason, str) and reason in HTTP_REASONS:
+                diagnostic['reason'] = reason
+            metadata = detail.get('metadata', {})
+            if not isinstance(metadata, dict):
+                continue
+            metric, limit = metadata.get('quota_metric'), metadata.get('quota_limit')
+            if isinstance(metric, str) and metric in QUOTA_METRICS:
+                diagnostic['quota_metric'] = metric
+            if isinstance(limit, str) and (QUOTA_LIMIT_PATTERN.fullmatch(limit) or QUOTA_SNAKE_LIMIT_PATTERN.fullmatch(limit)):
+                diagnostic['quota_limit'] = limit
+    # Messages are never retained; only known phrases classify the rejection.
+    message = api.get('message', '')
+    message = message.lower() if isinstance(message, str) else ''
+    if 'quota_metric' not in diagnostic:
+        for metric in sorted(QUOTA_METRICS):
+            if metric in message:
+                diagnostic['quota_metric'] = metric
+                break
+    if 'quota_limit' not in diagnostic:
+        original = api.get('message', '')
+        if isinstance(original, str):
+            for match in re.finditer(r"(?:quota )?limit ['\"]([^'\"]+)['\"]", original, re.IGNORECASE):
+                name = match.group(1)
+                if QUOTA_LIMIT_PATTERN.fullmatch(name) or QUOTA_SNAKE_LIMIT_PATTERN.fullmatch(name):
+                    diagnostic['quota_limit'] = name
+                    break
+    if diagnostic.get('quota_metric'):
+        metric = diagnostic['quota_metric']
+        category = 'request_quota' if 'requests' in metric else 'token_quota' if 'tokens' in metric else 'audio_quota'
+    elif diagnostic.get('reason') == 'QUOTA_EXCEEDED' or any(
+            phrase in message for phrase in ('quota exceeded', 'exceeded your quota', 'quota limit')):
+        category = 'quota_exceeded'
+    elif diagnostic.get('reason') == 'RATE_LIMIT_EXCEEDED' or any(
+            phrase in message for phrase in ('rate limit', 'too many requests')):
+        category = 'rate_limited'
+    elif any(phrase in message for phrase in ('model overloaded', 'service overloaded', 'out of capacity', 'no available capacity')):
+        category = 'service_capacity'
+    elif error.code == 429:
+        category = 'resource_exhausted_unspecified'
+    elif 500 <= error.code <= 599:
+        category = 'server_error'
+    elif error.code == 401:
+        category = 'authentication_rejected'
+    else:
+        category = 'request_rejected'
+    if category.endswith('quota') or category == 'quota_exceeded':
+        if 'PerDay' in diagnostic.get('quota_limit', '') or '_per_day' in diagnostic.get('quota_limit', ''):
+            category = 'daily_quota'
+    diagnostic['category'] = category
+    if retry_delays:
+        diagnostic['retry_after_seconds'] = max(retry_delays)
+    return diagnostic
+
+
+def diagnostic_text(diagnostic):
+    return '; '.join(f'{key}={diagnostic[key]}' for key in (
+        'http_status', 'status', 'reason', 'category', 'quota_metric', 'quota_limit', 'retry_after_seconds')
+                     if key in diagnostic)
+
+
+def request_audit(path):
+    return read_json(path) if path.exists() else {
+        'attempts': 0, 'rejections': 0, 'retries': 0, 'uncertain_outcomes': 0,
+        'rejection_counts': {}, 'diagnostics': []}
+
+
 class RequestPool:
     """One pool shared by all episode/section threads in this runner process."""
-    def __init__(self, workers, project=None, gcloud='gcloud', request=None, sleep=None):
+    def __init__(self, workers, project=None, gcloud='gcloud', request=None, sleep=None,
+                 clock=None, random=None, wall_clock=None):
         self.limit = threading.BoundedSemaphore(workers)
         self.project, self.gcloud = project, gcloud
         self.request = request or request_json
         self.sleep = sleep or time.sleep
+        self.clock = clock or time.monotonic
+        self.random = random or random_module.random
+        self.wall_clock = wall_clock or time.time
         self._token = None
+        self._token_acquired_at = None
         self._token_lock = threading.Lock()
         self._models = {}
         self._model_lock = threading.Lock()
+        self._cooldown_lock = threading.Lock()
+        self._cooldown_until = 0.0
+
+    def wait_for_cooldown(self):
+        while True:
+            with self._cooldown_lock:
+                remaining = self._cooldown_until - self.clock()
+            if remaining <= 0:
+                return
+            # Short slices respond to a concurrent extension without an unbounded
+            # sleep. Offline tests inject a clock-advancing sleeper, never a no-op.
+            self.sleep(min(remaining, 60.0))
+
+    def cooldown(self, seconds):
+        with self._cooldown_lock:
+            self._cooldown_until = max(self._cooldown_until, self.clock() + seconds)
+
+    def retry_delay(self, attempt, diagnostic):
+        jitter = min(1.0, max(0.0, self.random()))
+        exponential = 60 * (2 ** attempt) * (1 + 0.2 * jitter)
+        return min(MAX_RETRY_DELAY, max(exponential, diagnostic.get('retry_after_seconds', 0)))
 
     def resolve_model(self, location, requested):
         if requested != 'auto':
@@ -300,7 +472,8 @@ class RequestPool:
 
     def token(self):
         with self._token_lock:
-            if self._token is None:
+            if self._token is None or (self._token_acquired_at is not None and
+                                      self.clock() - self._token_acquired_at >= TOKEN_REFRESH_SECONDS):
                 env = dict(os.environ, CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true',
                            CLOUDSDK_CORE_DISABLE_USAGE_REPORTING='true')
                 try:
@@ -311,6 +484,7 @@ class RequestPool:
                 self._token = result.stdout.strip()
                 if not self._token:
                     raise SubtitleError('gcloud returned no access token')
+                self._token_acquired_at = self.clock()
             return self._token
 
     def transcribe(self, audio, output, duration, configuration):
@@ -327,27 +501,64 @@ class RequestPool:
         model = urllib.parse.quote(configuration['model'], safe='')
         url = f'https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent'
         payload = payload_for(audio, configuration)
-        with self.limit:
-            token = self.token()
-            for attempt in range(3):
-                atomic_json(marker, {'state': 'request-started', 'attempt': attempt + 1})
+        audit_path = output.with_suffix('.requests.json')
+        audit = request_audit(audit_path)
+        for attempt in range(3):
+            with self.limit:
+                while True:
+                    self.wait_for_cooldown()
+                    token = self.token()  # Refresh proactively, before submitting audio.
+                    with self._cooldown_lock:
+                        # Authentication can outlast another thread's rejection.
+                        if self.clock() < self._cooldown_until:
+                            continue
+                        atomic_json(marker, {'state': 'request-started', 'attempt': attempt + 1})
+                        audit['attempts'] += 1
+                        audit['retries'] += int(attempt > 0)
+                        audit['last_outcome'] = 'request_started'
+                        atomic_json(audit_path, audit)
+                        break
                 try:
                     data = self.request(url, payload, token)
                 except urllib.error.HTTPError as error:
                     # A known HTTP rejection may be retried. Unknown outcomes retain
                     # the marker so a restart cannot silently repeat the paid request.
-                    marker.unlink(missing_ok=True)
                     retryable = error.code == 429 or 500 <= error.code <= 599
-                    error.close()
-                    if retryable and attempt < 2:
-                        self.sleep(2 ** attempt)
+                    try:
+                        diagnostic = http_diagnostic(error, self.wall_clock)
+                    finally:
+                        error.close()
+                    diagnostic.update(attempt=audit['attempts'], retry_scheduled=retryable and attempt < 2)
+                    if retryable:
+                        diagnostic['cooldown_seconds'] = self.retry_delay(attempt, diagnostic)
+                        self.cooldown(diagnostic['cooldown_seconds'])
+                    audit['rejections'] += 1
+                    key = str(error.code)
+                    audit['rejection_counts'][key] = audit['rejection_counts'].get(key, 0) + 1
+                    audit['diagnostics'].append(diagnostic)
+                    audit['last_outcome'] = 'rejected'
+                    atomic_json(audit_path, audit)
+                    marker.unlink(missing_ok=True)
+                    text = diagnostic_text(diagnostic)
+                    wait = f"; retry after shared cooldown {diagnostic['cooldown_seconds']:.1f}s" if diagnostic['retry_scheduled'] else '; no further retry'
+                    print(f'API rejection: {text}; attempt {attempt + 1}/3{wait}', flush=True)
+                    if error.code == 401:
+                        with self._token_lock:
+                            if self._token == token:
+                                self._token = None
+                    if diagnostic['retry_scheduled']:
                         continue
-                    raise SubtitleError(f'API request failed: HTTP {error.code}') from error
+                    raise SubtitleError(f'API request failed: {text}') from None
                 except Exception as error:
-                    raise SubtitleError('API request outcome is uncertain; request was not replayed') from error
+                    audit['uncertain_outcomes'] += 1
+                    audit['last_outcome'] = 'uncertain'
+                    atomic_json(audit_path, audit)
+                    raise SubtitleError('API request outcome is uncertain; request was not replayed') from None
                 # Keep the raw response even if validation fails: never pay twice
                 # merely because formatting or API validation failed after success.
                 atomic_json(output, data)
+                audit['last_outcome'] = 'succeeded'
+                atomic_json(audit_path, audit)
                 marker.unlink(missing_ok=True)
                 timed_words(data, duration)
                 return data
@@ -540,11 +751,29 @@ def usage_summary(results):
     return totals
 
 
+def request_summary(cache):
+    totals = {'attempts': 0, 'rejections': 0, 'retries': 0, 'uncertain_outcomes': 0,
+              'rejection_counts': {}, 'chunks': [], 'invalid_audit_files': 0}
+    if cache is None:
+        return totals
+    for path in sorted(cache.glob('chunk-[0-9][0-9][0-9].requests.json')):
+        try:
+            audit = request_audit(path)
+            for name in ('attempts', 'rejections', 'retries', 'uncertain_outcomes'):
+                totals[name] += audit[name]
+            for status, count in audit['rejection_counts'].items():
+                totals['rejection_counts'][status] = totals['rejection_counts'].get(status, 0) + count
+            totals['chunks'].append({'chunk': path.name.removesuffix('.requests.json'), **audit})
+        except (SubtitleError, KeyError, TypeError, ValueError):
+            totals['invalid_audit_files'] += 1
+    return totals
+
+
 def empty_result(video, output, configuration):
     return {'source_name': video.name, 'output': str(output), 'status': 'failed',
             'model': configuration['model'], 'settings': configuration,
             'cue_count': 0, 'word_count': 0, 'corrections': [], 'review_flags': [],
-            'usage': usage_summary([])}
+            'usage': usage_summary([]), 'requests': request_summary(None)}
 
 
 def resolved_configuration(video, args, pool, root):
@@ -694,6 +923,7 @@ def process_episode(video, args, pool):
                         pass
                 result['usage'] = usage_summary(saved)
             if cache:
+                result['requests'] = request_summary(cache)
                 atomic_json(cache / 'result.json', result)
             atomic_json(root / 'result.json', result)
     except Exception as error:
