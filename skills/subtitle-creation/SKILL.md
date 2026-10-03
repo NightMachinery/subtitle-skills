@@ -136,6 +136,23 @@ Honor an explicitly requested agent model/effort. Keep prompts fresh and limited
 to the skill, assigned media, output ownership, and selected configuration.
 Workers must not edit the skill, commit files, or process unassigned episodes.
 
+## Reviewed timing corrections
+
+If a saved raw response has an invalid word interval, halt further paid work.
+Keep that response intact. Recheck one bounded audio clip and preserve its raw
+response separately. Only when an indexed same-word recheck anchor supports
+both endpoints may an agent explicitly author a private adjacent
+`chunk-NNN.timing-overrides.json`. Its exact raw checksum, original word/offset
+identity, reviewer/reason and bounded audio evidence are validated before the
+runner applies offsets to an in-memory copy. Read the strict schema in
+[validation guidance](../../docs/validation.md#explicit-reviewed-timing-overlays).
+Never guess an endpoint, silently edit raw responses, or create an overlay to
+bypass unresolved evidence. Overlay provenance stays in final private review
+flags and corrections; approved existing SRTs remain protected. Use the same
+cache and model settings with `--format-only` after review, without paying to
+repeat successful transcription. A fresh successful response with invalid
+timing stops queued sections and remains cached without an uncertain marker.
+
 ## Reviewed priority waves
 
 For ordered multi-series work, use the bundled `scripts/batch.py` with an

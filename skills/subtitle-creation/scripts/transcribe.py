@@ -8,6 +8,7 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
+import copy
 from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
@@ -283,6 +284,133 @@ def timed_words(data, duration):
     return words
 
 
+def checkpoint_word(data, part_index, word_index):
+    """Index the first candidate's exact part/word, without Python bool indices."""
+    if any(type(value) is not int or value < 0 for value in (part_index, word_index)):
+        raise SubtitleError('Timing override indices must be nonnegative integers')
+    try:
+        word = data['candidates'][0]['content']['parts'][part_index]['audioTranscription']['words'][word_index]
+    except (KeyError, IndexError, TypeError):
+        raise SubtitleError('Timing override word index does not identify a transcript word') from None
+    if not isinstance(word, dict):
+        raise SubtitleError('Timing override target is not a transcript word')
+    return word
+
+
+def timing_number(value):
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise SubtitleError('Timing override times must be finite numbers')
+    return value
+
+
+def read_checkpoint(path, duration, include_corrections=False):
+    """Validate immutable raw JSON, applying only explicitly verified timing overlays.
+
+    By default returns transcript data. include_corrections returns (data, audit).
+    The audit contains private paths and reviewer evidence; never publish it.
+    """
+    try:
+        return _read_checkpoint(path, duration, include_corrections)
+    except SubtitleError:
+        raise
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError, RecursionError):
+        raise SubtitleError('Malformed transcript checkpoint or timing override') from None
+
+
+def _read_checkpoint(path, duration, include_corrections):
+    path = Path(path)
+    try:
+        raw_bytes = path.read_bytes()
+        data = json.loads(raw_bytes)
+    except (OSError, ValueError, UnicodeError):
+        raise SubtitleError('Missing or invalid transcript checkpoint') from None
+    adjustments = []
+    overlay_path = path.with_suffix('.timing-overrides.json')
+    if overlay_path.exists():
+        overlay = read_json(overlay_path)
+        if (not isinstance(overlay, dict) or set(overlay) != {'version', 'source_sha256', 'corrections'}
+                or type(overlay['version']) is not int or overlay['version'] != 1
+                or overlay['source_sha256'] != hashlib.sha256(raw_bytes).hexdigest()
+                or not isinstance(overlay['corrections'], list) or not overlay['corrections']):
+            raise SubtitleError('Timing override schema or raw checkpoint checksum is invalid')
+        data = copy.deepcopy(data)
+        seen = set()
+        keys = {'part_index', 'word_index', 'word', 'old_start_offset', 'old_end_offset',
+                'start_seconds', 'end_seconds', 'reviewer', 'reason', 'evidence'}
+        evidence_keys = {'recheck_path', 'recheck_sha256', 'clip_start_seconds', 'clip_end_seconds',
+                         'recheck_part_index', 'recheck_word_index'}
+        for correction in overlay['corrections']:
+            if not isinstance(correction, dict) or set(correction) != keys:
+                raise SubtitleError('Timing override correction schema is invalid')
+            word = checkpoint_word(data, correction['part_index'], correction['word_index'])
+            key = (correction['part_index'], correction['word_index'])
+            if key in seen:
+                raise SubtitleError('Duplicate timing override word identity')
+            seen.add(key)
+            if (not isinstance(correction['word'], str) or not correction['word'].strip()
+                    or correction['word'] != word.get('word')
+                    or any(type(correction[field]) is not type(word.get(raw_field))
+                           or correction[field] != word.get(raw_field)
+                           for field, raw_field in (('old_start_offset', 'startOffset'),
+                                                    ('old_end_offset', 'endOffset')))):
+                raise SubtitleError('Timing override original word or offsets do not match')
+            if any(not isinstance(correction[field], str) or not correction[field].strip()
+                   for field in ('reviewer', 'reason')):
+                raise SubtitleError('Timing override reviewer and reason are required')
+            start, end = (timing_number(correction[field]) for field in ('start_seconds', 'end_seconds'))
+            if not 0 <= start < end <= duration:
+                raise SubtitleError('Timing override endpoints are outside the section or reversed')
+            evidence = correction['evidence']
+            if not isinstance(evidence, dict) or set(evidence) != evidence_keys:
+                raise SubtitleError('Timing override bounded audio recheck evidence is incomplete')
+            clip_start, clip_end = (timing_number(evidence[field])
+                                   for field in ('clip_start_seconds', 'clip_end_seconds'))
+            if not 0 <= clip_start < clip_end <= duration or clip_end - clip_start > 60:
+                raise SubtitleError('Timing override recheck clip must be bounded within the section')
+            if (not isinstance(evidence['recheck_path'], str)
+                    or not Path(evidence['recheck_path']).is_absolute()
+                    or Path(evidence['recheck_path']).suffix != '.json'
+                    or not isinstance(evidence['recheck_sha256'], str)):
+                raise SubtitleError('Timing override requires an absolute raw recheck JSON path and checksum')
+            try:
+                recheck_bytes = Path(evidence['recheck_path']).read_bytes()
+                recheck = json.loads(recheck_bytes)
+                if evidence['recheck_sha256'] != hashlib.sha256(recheck_bytes).hexdigest():
+                    raise SubtitleError('Timing override raw recheck checksum changed')
+                clip_duration = clip_end - clip_start
+                timed_words(recheck, clip_duration)
+                # Evidence uses exact clip bounds, without the base raw validator's
+                # quarter-second tolerance or end clamping.
+                for part in recheck['candidates'][0]['content']['parts']:
+                    for anchor in part.get('audioTranscription', {}).get('words', []):
+                        if not 0 <= offset(anchor['startOffset']) <= offset(anchor['endOffset']) <= clip_duration:
+                            raise SubtitleError('Timing override recheck word is outside the exact clip')
+                anchor = checkpoint_word(recheck, evidence['recheck_part_index'], evidence['recheck_word_index'])
+            except (OSError, ValueError, UnicodeError, KeyError, TypeError, AttributeError):
+                raise SubtitleError('Timing override raw recheck evidence is malformed or unavailable') from None
+            if (anchor.get('word') != correction['word']
+                    or not math.isclose(start, clip_start + offset(anchor.get('startOffset')), rel_tol=0, abs_tol=1e-6)
+                    or not math.isclose(end, clip_start + offset(anchor.get('endOffset')), rel_tol=0, abs_tol=1e-6)):
+                raise SubtitleError('Timing override endpoints or word lack matching raw recheck support')
+            # The raw file and every other copied field stay untouched.
+            word['startOffset'], word['endOffset'] = start, end
+            parts = data['candidates'][0]['content']['parts']
+            local_index = sum(len(part.get('audioTranscription', {}).get('words', []))
+                              for part in parts[:correction['part_index']]) + correction['word_index']
+            adjustments.append({'kind': 'reviewed_timing_override', **copy.deepcopy(correction),
+                                'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve()),
+                                'source_sha256': overlay['source_sha256'], 'local_word_index': local_index})
+    try:
+        timed_words(data, duration)
+    except (TypeError, KeyError, AttributeError, ValueError):
+        raise SubtitleError('Malformed transcript checkpoint') from None
+    return (data, adjustments) if include_corrections else data
+
+
 def payload_for(audio, configuration):
     transcription = {'wordTimestamp': True, 'diarization': True}
     if configuration['language'] != 'auto':
@@ -497,11 +625,17 @@ class RequestPool:
             if self._fatal_error is not None:
                 raise SubtitleError(self._fatal_error)
 
+    def checked_checkpoint(self, path, duration):
+        try:
+            return read_checkpoint(path, duration)
+        except SubtitleError:
+            with self._fatal_lock:
+                self._fatal_error = 'API request pool stopped after transcript validation failed; inspect its checkpoint'
+            raise
+
     def transcribe(self, audio, output, duration, configuration):
-        if output.exists():
-            data = read_json(output)
-            timed_words(data, duration)
-            return data
+        if output.exists() or output.with_suffix('.timing-overrides.json').exists():
+            return self.checked_checkpoint(output, duration)
         marker = output.with_suffix('.inflight.json')
         if marker.exists():
             raise SubtitleError('Previous request outcome is uncertain; review its inflight checkpoint before retrying')
@@ -577,8 +711,7 @@ class RequestPool:
                 audit['last_outcome'] = 'succeeded'
                 atomic_json(audit_path, audit)
                 marker.unlink(missing_ok=True)
-                timed_words(data, duration)
-                return data
+                return self.checked_checkpoint(output, duration)
 
 
 def wrap_words(words):
@@ -653,8 +786,9 @@ def make_cues(words, duration):
     return cues
 
 
-def repair_long_words(words, silences):
+def repair_long_words(words, silences, reviewed_word_ids=None):
     corrections, flags = [], []
+    reviewed_word_ids = set(reviewed_word_ids or ())
     for word in words:
         interval = word['end'] - word['start']
         if interval < 0.04 or interval > 2:
@@ -668,7 +802,7 @@ def repair_long_words(words, silences):
                       and len(set(raw_ids)) == len(raw_ids))
     positions = {word['id']: index for index, word in enumerate(raw_order)}
     for word in reversed(raw_order):
-        if word['end'] - word['start'] <= 2:
+        if word['id'] in reviewed_word_ids or word['end'] - word['start'] <= 2:
             continue
         pauses = [pause for pause in silences if pause['end'] - pause['start'] >= 0.35
                   and word['start'] <= pause['start'] < pause['end'] < word['end']
@@ -976,9 +1110,8 @@ def process_episode(video, args, pool):
                 for chunk in chunks:
                     index = chunk['index']
                     checkpoint = cache / f'chunk-{index:03}.json'
-                    if checkpoint.exists():
-                        data = read_json(checkpoint)
-                        timed_words(data, chunk['end'] - chunk['start'])
+                    if checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists():
+                        data = read_checkpoint(checkpoint, chunk['end'] - chunk['start'])
                         results[index] = data
                     elif args.format_only:
                         raise SubtitleError('Missing transcript checkpoint in format-only mode')
@@ -998,17 +1131,26 @@ def process_episode(video, args, pool):
                     for future in as_completed(futures):
                         results[futures[future]] = future.result()
                 result['usage'] = usage_summary(results.values())
-                words = []
+                words, overlay_corrections = [], []
                 for chunk in chunks:
                     index = chunk['index']
-                    for word in timed_words(results[index], chunk['end'] - chunk['start']):
+                    data, adjustments = read_checkpoint(cache / f'chunk-{index:03}.json',
+                                                        chunk['end'] - chunk['start'], include_corrections=True)
+                    for adjustment in adjustments:
+                        adjustment.update(section=index, word_id=len(words) + adjustment['local_word_index'],
+                                          global_start=chunk['start'] + adjustment['start_seconds'],
+                                          global_end=chunk['start'] + adjustment['end_seconds'])
+                    overlay_corrections.extend(adjustments)
+                    for word in timed_words(data, chunk['end'] - chunk['start']):
                         word.update(start=word['start'] + chunk['start'], end=word['end'] + chunk['start'],
                                     speaker=f"{index}:{word['speaker']}", section=index, id=len(words))
                         words.append(word)
-                corrections, flags = repair_long_words(words, preparation['silences'])
+                corrections, flags = repair_long_words(words, preparation['silences'],
+                                                       reviewed_word_ids={item['word_id'] for item in overlay_corrections})
                 words.sort(key=lambda word: (word['start'], word['id']))
                 atomic_json(cache / 'words.json', words)
-                result.update(word_count=len(words), corrections=corrections, review_flags=flags)
+                result.update(word_count=len(words), corrections=overlay_corrections + corrections,
+                              review_flags=copy.deepcopy(overlay_corrections) + flags)
                 cues = make_cues(words, duration)
                 result['review_flags'].extend(validate_cues(cues, words, duration))
                 atomic_json(cache / 'cues.json', cues)

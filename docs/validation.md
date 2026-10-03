@@ -39,3 +39,53 @@ Apply this offline through existing cached responses and preserve reviewed SRTs;
 representative audio review remains necessary for inferred timing.
 
 Authentication renewal explicitly asks gcloud for a fresh token before caching it for at most 45 minutes. A token returned from the existing gcloud cache may have less remaining lifetime than a newly minted token, so acquisition time alone is insufficient. Credentials and auth command output remain in memory; errors are sanitized. A terminal HTTP rejection or unknown request outcome stops queued sections in that request pool before inflight markers or attempt audits are created. Already submitted requests may finish. HTTP401 never automatically replays audio; a coordinator must inspect known rejection evidence and deliberately resume missing sections. Synthetic tests cover fresh-token acquisition, sanitized auth failure and queued-section cancellation.
+
+## Explicit reviewed timing overlays
+
+Keep raw response JSON byte-for-byte intact when a bounded audio recheck
+supports correcting an invalid word interval. The runner never creates an
+overlay automatically. A private `chunk-NNN.timing-overrides.json` beside the
+raw `chunk-NNN.json` contains exactly `version: 1`, `source_sha256` (SHA256 of
+the raw checkpoint bytes), and a nonempty `corrections` array. Each correction
+has exactly these fields:
+
+- `part_index`, `word_index`: nonnegative integer indices into the first
+  candidate's parts and that part's audio-transcription words. Booleans and
+  duplicate targets are rejected.
+- `word`, `old_start_offset`, `old_end_offset`: exact original word and offset
+  values, including offset value types and original string spelling.
+- `start_seconds`, `end_seconds`: finite numeric section-local endpoints,
+  ordered strictly and inside the section.
+- `reviewer`, `reason`: nonempty text identifying the review and its purpose.
+- `evidence`: the exact object described below.
+
+Evidence has exactly `recheck_path`, `recheck_sha256`, `clip_start_seconds`,
+`clip_end_seconds`, `recheck_part_index`, and `recheck_word_index`. The path is
+an absolute existing `.json` raw audio-recheck response; its byte checksum must
+match. Clip boundaries use section-local seconds, are positive in duration,
+inside the original section, and at most 60 seconds apart. The complete recheck
+must finish successfully and all its word timings must fit the exact clip
+duration. The indexed anchor must have the same word text. Proposed endpoints
+must equal clip start plus its actual raw offsets, with only one microsecond of
+floating-point tolerance. Manual claims without this retained word anchor are
+not accepted.
+
+The centralized `read_checkpoint` validates the overlay even if the raw words
+already pass timing checks. It changes only offsets in an in-memory deep copy;
+text, speaker fields, other response fields and raw bytes remain unchanged.
+Stale hashes, missing evidence, unknown fields, malformed indices/endpoints,
+and an orphan overlay without its raw checkpoint stop processing. Verified
+manual intervals are protected from subsequent inferred onset repair. Final
+`corrections` and `review_flags` retain the original offsets, reviewer, reason,
+raw checkpoint hashes, checkpoint/overlay paths, anchor evidence, section and word ID.
+These records are private and must stay outside public repositories.
+
+Pool cache hits, newly returned responses and episode checkpoint reads use the
+same validation. A successfully returned response is saved and its inflight
+marker removed before timing validation. Invalid timing then stops queued
+requests, retains the successful response/audit, and produces no uncertain
+marker or automatic replay. Preserve approved SRTs and use explicit cached
+formatting for unapproved outputs after a supported overlay is reviewed.
+Transcription settings and cache identity are unchanged. Synthetic offline
+tests cover anchor verification, exact identity, malformed evidence, byte
+preservation, private provenance, format-only reuse and queued cancellation.

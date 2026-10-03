@@ -1,6 +1,8 @@
 """Offline invariants. Run: python3 -B tests/test_transcribe.py [path/to/transcribe.py]"""
 import importlib.util
 import contextlib
+import copy
+import hashlib
 from email.utils import formatdate
 import io
 import json
@@ -164,6 +166,233 @@ class RunnerTests(unittest.TestCase):
                 pool.transcribe(b'offline', path, 10, t.settings(t.parser().parse_args(['episode.wav'])))
         self.assertEqual(calls, [1])
         self.assertTrue(path.exists())
+
+    def timing_overlay(self, path, *, raw=None):
+        raw = response() if raw is None else raw
+        target = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]
+        target['endOffset'] = '0.1s'
+        t.atomic_json(path, raw)
+        recheck = response()
+        anchor = recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]
+        anchor.update(startOffset='0.2s', endOffset='0.6s')
+        evidence = path.parent / 'bounded-recheck.json'
+        t.atomic_json(evidence, recheck)
+        overlay = {'version': 1, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                   'corrections': [{'part_index': 0, 'word_index': 0, 'word': target['word'],
+                       'old_start_offset': target['startOffset'], 'old_end_offset': target['endOffset'],
+                       'start_seconds': 0.2, 'end_seconds': 0.6, 'reviewer': 'synthetic reviewer',
+                       'reason': 'bounded audio timing check',
+                       'evidence': {'recheck_path': str(evidence.resolve()),
+                           'recheck_sha256': hashlib.sha256(evidence.read_bytes()).hexdigest(),
+                           'clip_start_seconds': 0, 'clip_end_seconds': 4,
+                           'recheck_part_index': 0, 'recheck_word_index': 0}}]}
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        return overlay
+
+    def test_verified_timing_overlay_keeps_raw_bytes_and_other_fields(self):
+        path = self.directory / 'chunk-000.json'
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['speakerLabel'] = 'original'
+        raw['candidates'][0]['content']['parts'].insert(0, {'text': 'synthetic non-audio part'})
+        # Build a fixture whose exact target part is the audio part at index one.
+        audio = raw['candidates'][0]['content']['parts'].pop(1)
+        raw['candidates'][0]['content']['parts'].pop(0)
+        raw['candidates'][0]['content']['parts'].append(audio)
+        overlay = self.timing_overlay(path, raw=raw)
+        raw = t.read_json(path)
+        raw['candidates'][0]['content']['parts'].insert(0, {'text': 'synthetic non-audio part'})
+        t.atomic_json(path, raw)
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        overlay['corrections'][0]['part_index'] = 1
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        before = path.read_bytes()
+        data, corrections = t.read_checkpoint(path, 10, include_corrections=True)
+        expected = copy.deepcopy(raw)
+        expected['candidates'][0]['content']['parts'][1]['audioTranscription']['words'][0].update(
+            startOffset=0.2, endOffset=0.6)
+        self.assertEqual(data, expected)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(corrections[0]['local_word_index'], 0)
+        self.assertEqual(corrections[0]['evidence'], overlay['corrections'][0]['evidence'])
+
+    def test_timing_overlay_maps_bounded_clip_offsets_into_section_time(self):
+        path = self.directory / 'chunk-000.json'
+        overlay = self.timing_overlay(path)
+        correction = overlay['corrections'][0]
+        correction.update(start_seconds=2.2, end_seconds=2.6)
+        correction['evidence'].update(clip_start_seconds=2, clip_end_seconds=6)
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        data = t.read_checkpoint(path, 10)
+        word = t.timed_words(data, 10)[0]
+        self.assertEqual((word['start'], word['end']), (2.2, 2.6))
+
+    def test_timing_overlay_rejects_checksum_identity_indices_and_extra_changes(self):
+        path = self.directory / 'chunk-000.json'
+        valid = self.timing_overlay(path)
+        changes = [('checksum', lambda value: value.update(source_sha256='0' * 64)),
+                   ('word', lambda value: value['corrections'][0].update(word='different')),
+                   ('old start', lambda value: value['corrections'][0].update(old_start_offset='0.4s')),
+                   ('old type', lambda value: value['corrections'][0].update(old_end_offset=0.1)),
+                   ('bool index', lambda value: value['corrections'][0].update(part_index=True)),
+                   ('negative index', lambda value: value['corrections'][0].update(word_index=-1)),
+                   ('range index', lambda value: value['corrections'][0].update(word_index=999)),
+                   ('duplicate', lambda value: value['corrections'].append(copy.deepcopy(value['corrections'][0]))),
+                   ('speaker edit', lambda value: value['corrections'][0].update(speaker='replacement')),
+                   ('version bool', lambda value: value.update(version=True)),
+                   ('empty corrections', lambda value: value.update(corrections=[]))]
+        for name, change in changes:
+            with self.subTest(case=name):
+                value = copy.deepcopy(valid)
+                change(value)
+                t.atomic_json(path.with_suffix('.timing-overrides.json'), value)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_timing_overlay_requires_verified_bounded_raw_recheck_evidence(self):
+        path = self.directory / 'chunk-000.json'
+        valid = self.timing_overlay(path)
+        changes = [('reviewer', lambda value: value.update(reviewer=' ')),
+                   ('reason', lambda value: value.update(reason='')),
+                   ('evidence', lambda value: value.update(evidence={})),
+                   ('evidence checksum', lambda value: value['evidence'].update(recheck_sha256='0' * 64)),
+                   ('evidence path', lambda value: value['evidence'].update(recheck_path='relative.json')),
+                   ('evidence index', lambda value: value['evidence'].update(recheck_word_index=True)),
+                   ('clip range', lambda value: value['evidence'].update(clip_end_seconds=11)),
+                   ('clip reversed', lambda value: value['evidence'].update(clip_start_seconds=4)),
+                   ('unsupported time', lambda value: value.update(start_seconds=0.25)),
+                   ('nonfinite', lambda value: value.update(start_seconds=float('nan'))),
+                   ('boolean time', lambda value: value.update(end_seconds=True)),
+                   ('reversed', lambda value: value.update(start_seconds=0.7)),
+                   ('outside', lambda value: value.update(end_seconds=11))]
+        for name, change in changes:
+            with self.subTest(case=name):
+                value = copy.deepcopy(valid)
+                change(value['corrections'][0])
+                path.with_suffix('.timing-overrides.json').write_text(json.dumps(value))
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        value = copy.deepcopy(valid)
+        value['corrections'][0]['evidence']['clip_end_seconds'] = 70
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), value)
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 100)
+
+    def test_timing_overlay_rejects_unfinished_malformed_or_out_of_clip_recheck(self):
+        path = self.directory / 'chunk-000.json'
+        valid = self.timing_overlay(path)
+        evidence_path = Path(valid['corrections'][0]['evidence']['recheck_path'])
+        original = t.read_json(evidence_path)
+        changes = [('unfinished', lambda value: value['candidates'][0].update(finishReason='MAX_TOKENS')),
+                   ('word mismatch', lambda value: value['candidates'][0]['content']['parts'][0]
+                    ['audioTranscription']['words'][0].update(word='Different')),
+                   ('bad timing', lambda value: value['candidates'][0]['content']['parts'][0]
+                    ['audioTranscription']['words'][0].update(endOffset='0.1s')),
+                   ('exact clip', lambda value: value['candidates'][0]['content']['parts'][0]
+                    ['audioTranscription']['words'][-1].update(endOffset='4.05s'))]
+        for name, change in changes:
+            with self.subTest(case=name):
+                recheck = copy.deepcopy(original)
+                change(recheck)
+                t.atomic_json(evidence_path, recheck)
+                overlay = copy.deepcopy(valid)
+                overlay['corrections'][0]['evidence']['recheck_sha256'] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_orphan_overlay_cannot_trigger_paid_request(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        self.timing_overlay(path)
+        path.unlink()
+        pool = self.pool(lambda *_: self.fail('orphan overlay must not trigger paid work'))
+        with patch.object(pool, 'token', side_effect=AssertionError('authentication called')):
+            with self.assertRaises(t.SubtitleError):
+                pool.transcribe(b'offline', path, 10, t.settings(args))
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_suffix('.requests.json').exists())
+
+    def test_overlay_is_validated_even_when_raw_timing_is_already_valid(self):
+        path = self.directory / 'chunk-000.json'
+        overlay = self.timing_overlay(path)
+        t.atomic_json(path, response())
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        overlay['corrections'][0]['old_end_offset'] = '0.7s'
+        overlay['corrections'][0]['reviewer'] = ''
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        with self.assertRaisesRegex(t.SubtitleError, 'reviewer'):
+            t.read_checkpoint(path, 10)
+
+    def test_overlay_pool_cache_and_format_only_resume_keep_provenance_without_api(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay = self.timing_overlay(path)
+        before = path.read_bytes()
+        pool = self.pool(lambda *_: self.fail('API called for cached overlay'))
+        with patch.object(pool, 'token', side_effect=AssertionError('authentication called')):
+            data = pool.transcribe(b'offline', path, 10, t.settings(args))
+            self.assertEqual(t.timed_words(data, 10)[0]['start'], 0.2)
+            args.format_only = True
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(result['corrections'][0]['kind'], 'reviewed_timing_override')
+        self.assertEqual(result['corrections'][0]['source_sha256'], overlay['source_sha256'])
+        self.assertEqual(result['corrections'][0]['word_id'], 0)
+        self.assertEqual(result['review_flags'][0]['evidence'], overlay['corrections'][0]['evidence'])
+        self.assertEqual(t.FORMAT_VERSION, 1)
+
+    def test_verified_overlay_onset_is_not_repaired_again_from_silence(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'] = [
+            {'word': 'Example.', 'startOffset': '0.3s', 'endOffset': '0.1s'}]
+        overlay = self.timing_overlay(path, raw=raw)
+        correction = overlay['corrections'][0]
+        correction['end_seconds'] = 3.0
+        evidence_path = Path(correction['evidence']['recheck_path'])
+        recheck = response()
+        recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'] = [
+            {'word': 'Example.', 'startOffset': '0.2s', 'endOffset': '3.0s'}]
+        t.atomic_json(evidence_path, recheck)
+        correction['evidence']['recheck_sha256'] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        prep = t.read_json(cache / 'preparation.json')
+        prep['silences'] = [{'start': 1.0, 'end': 2.6}]
+        t.atomic_json(cache / 'preparation.json', prep)
+        args.format_only = True
+        result = t.process_episode(video, args, self.pool(lambda *_: self.fail('paid call')))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(t.read_json(cache / 'words.json')[0]['start'], 0.2)
+        self.assertEqual(t.read_json(cache / 'words.json')[0]['end'], 3.0)
+        self.assertEqual(len(result['corrections']), 1)
+        self.assertEqual(result['corrections'][0]['kind'], 'reviewed_timing_override')
+
+    def test_invalid_success_stops_queued_sections_without_uncertain_marker_or_replay(self):
+        video, args, cache = fixture(self.directory)
+        args.request_workers = 1
+        prep = t.read_json(cache / 'preparation.json')
+        prep['chunks'] = [{'index': 0, 'start': 0, 'end': 5}, {'index': 1, 'start': 5, 'end': 10}]
+        t.atomic_json(cache / 'preparation.json', prep)
+        calls = []
+        bad = response()
+        bad['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['endOffset'] = '0.1s'
+        pool = self.pool(lambda *_: calls.append(1) or bad)
+        result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(calls, [1])
+        self.assertEqual(t.read_json(cache / 'chunk-000.json'), bad)
+        self.assertEqual(result['requests']['attempts'], 1)
+        self.assertEqual(result['requests']['uncertain_outcomes'], 0)
+        self.assertFalse((cache / 'chunk-000.inflight.json').exists())
+        self.assertFalse((cache / 'chunk-001.requests.json').exists())
+        self.assertFalse((cache / 'chunk-001.inflight.json').exists())
+        resumed = t.process_episode(video, args, self.pool(lambda *_: self.fail('paid replay')))
+        self.assertEqual(resumed['status'], 'failed')
+        self.assertEqual(calls, [1])
 
     def test_unknown_outcome_not_replayed_even_on_restart(self):
         calls = []
