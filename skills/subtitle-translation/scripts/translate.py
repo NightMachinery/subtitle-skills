@@ -44,8 +44,19 @@ def prepare(args):
     tips = ''
     if args.tips:
         tips = args.tips.read_text(encoding='utf-8')
-    elif args.target_language.lower().split('-')[0] in ('fa', 'persian', 'farsi') or (args.source_language or '').lower().split('-')[0] in ('fa', 'persian', 'farsi'):
-        tips = (Path(__file__).resolve().parent.parent / 'references' / 'languages' / 'fa.md').read_text(encoding='utf-8')
+    else:
+        tip_dir = Path(__file__).resolve().parent.parent / 'references' / 'languages'
+        loaded = set()
+        aliases = {'persian': 'fa', 'farsi': 'fa'}
+        for language in (args.source_language or '', args.target_language):
+            tag = aliases.get(language.lower(), language.lower())
+            if not re.fullmatch(r'[a-z]{2,8}(?:-[a-z0-9]{1,8})*', tag):
+                continue
+            for candidate in dict.fromkeys((tag.split('-')[0], tag)):
+                tip = tip_dir / (candidate + '.md')
+                if tip.is_file() and tip not in loaded:
+                    tips += tip.read_text(encoding='utf-8') + '\n'
+                    loaded.add(tip)
     prompt = (PROMPT + f' Keep each cue within two lines of {args.width} characters.'
               ' For two-speaker dialogue, keep each speaker on one line within that limit.'
               ' Prefer short natural wording without dropping meaning.'

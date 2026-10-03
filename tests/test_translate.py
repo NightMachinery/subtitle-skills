@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -71,6 +72,25 @@ class TranslationTest(unittest.TestCase):
         manifest = json.loads((spanish_work / 'manifest.json').read_text())
         self.assertEqual(manifest['target_language'], 'es')
         self.assertEqual(manifest['source_language'], 'en')
+
+    def test_language_tip_extension_and_regional_tag(self):
+        skill = self.root / 'custom-skill'
+        scripts = skill / 'scripts'
+        tips = skill / 'references' / 'languages'
+        scripts.mkdir(parents=True)
+        tips.mkdir(parents=True)
+        shutil.copyfile(SCRIPT, scripts / 'translate.py')
+        (tips / 'es.md').write_text('Use concise Spanish wording.\n')
+        (tips / 'es-mx.md').write_text('Use Mexican regional vocabulary.\n')
+        work = self.root / 'regional-work'
+        result = subprocess.run([sys.executable, str(scripts / 'translate.py'),
+            'prepare', str(self.source), '--work-dir', str(work),
+            '--source-language', 'es', '--target-language', 'es-MX'],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = (work / 'batch-0001.prompt.txt').read_text()
+        self.assertEqual(prompt.count('Use concise Spanish wording.'), 1)
+        self.assertIn('Use Mexican regional vocabulary.', prompt)
 
     def test_no_clobber(self):
         self.assemble()

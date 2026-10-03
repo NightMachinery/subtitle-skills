@@ -85,3 +85,5 @@ The tests exercise source locks, resumability, bounded retries, model selection,
 subtitle integrity, and translation timeline preservation without paid API
 calls. Structural checks do not prove perfect transcription or translation;
 review representative cue text and flagged timings before delivery.
+
+For test and maintenance guidance, see [validation](docs/validation.md).
