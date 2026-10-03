@@ -666,6 +666,63 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(pool.token(), 'renewed-offline-token')
         self.assertEqual(auth.call_count, 1)
 
+    def test_auth_acquisition_forces_fresh_token_without_disclosing_output(self):
+        pool = self.pool()
+        pool._token = None
+        result = type('Result', (), {'stdout': 'fresh-synthetic-token\n'})()
+        with patch.object(t.subprocess, 'run', return_value=result) as auth:
+            self.assertEqual(pool.token(), 'fresh-synthetic-token')
+        self.assertEqual(auth.call_args.args[0], ['gcloud', 'config', 'config-helper',
+                         '--force-auth-refresh', '--format=value(credential.access_token)'])
+        self.assertTrue(auth.call_args.kwargs['capture_output'])
+
+    def test_auth_failure_withholds_secret_stderr(self):
+        pool = self.pool()
+        pool._token = None
+        error = t.subprocess.CalledProcessError(1, ['gcloud'], output='secret-sentinel', stderr='secret-sentinel')
+        with patch.object(t.subprocess, 'run', side_effect=error), self.assertRaises(t.SubtitleError) as caught:
+            pool.token()
+        self.assertEqual(str(caught.exception), 'gcloud authentication failed')
+        self.assertIsNone(pool._token)
+
+    def test_terminal_rejection_stops_queued_sections_before_submission(self):
+        video, args, cache = fixture(self.directory)
+        preparation = t.read_json(cache / 'preparation.json')
+        preparation['chunks'] = [{'index': 0, 'start': 0, 'end': 5},
+                                 {'index': 1, 'start': 5, 'end': 10}]
+        t.atomic_json(cache / 'preparation.json', preparation)
+        calls = []
+        def reject(*_):
+            calls.append(1)
+            raise urllib.error.HTTPError('https://invalid.test', 401, 'rejected', {},
+                io.BytesIO(b'{"error":{"status":"UNAUTHENTICATED"}}'))
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = t.process_episode(video, args, self.pool(reject))
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(calls, [1])
+        self.assertEqual(result['requests']['attempts'], 1)
+        self.assertFalse((cache / 'chunk-001.requests.json').exists())
+        self.assertFalse((cache / 'chunk-001.inflight.json').exists())
+        self.assertFalse((cache / 'chunk-001.json').exists())
+
+    def test_uncertain_request_stops_later_sections_and_preserves_marker(self):
+        calls = []
+        def unknown(*_):
+            calls.append(1)
+            raise OSError('secret-sentinel')
+        pool = self.pool(unknown)
+        configuration = t.settings(t.parser().parse_args(['episode.wav']))
+        first, second = self.directory / 'chunk-000.json', self.directory / 'chunk-001.json'
+        with self.assertRaises(t.SubtitleError):
+            pool.transcribe(b'offline', first, 10, configuration)
+        with self.assertRaises(t.SubtitleError) as caught:
+            pool.transcribe(b'offline', second, 10, configuration)
+        self.assertEqual(calls, [1])
+        self.assertTrue(first.with_suffix('.inflight.json').exists())
+        self.assertFalse(second.with_suffix('.inflight.json').exists())
+        self.assertFalse(second.with_suffix('.requests.json').exists())
+        self.assertNotIn('secret-sentinel', str(caught.exception))
+
     def test_401_never_blindly_replays_audio(self):
         calls = []
         def reject(*_):

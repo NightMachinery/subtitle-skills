@@ -37,3 +37,5 @@ measured-pause and sequence evidence, and a review flag. Word text, IDs,
 speaker labels, endpoints and transcription/cache identity stay unchanged.
 Apply this offline through existing cached responses and preserve reviewed SRTs;
 representative audio review remains necessary for inferred timing.
+
+Authentication renewal explicitly asks gcloud for a fresh token before caching it for at most 45 minutes. A token returned from the existing gcloud cache may have less remaining lifetime than a newly minted token, so acquisition time alone is insufficient. Credentials and auth command output remain in memory; errors are sanitized. A terminal HTTP rejection or unknown request outcome stops queued sections in that request pool before inflight markers or attempt audits are created. Already submitted requests may finish. HTTP401 never automatically replays audio; a coordinator must inspect known rejection evidence and deliberately resume missing sections. Synthetic tests cover fresh-token acquisition, sanitized auth failure and queued-section cancellation.

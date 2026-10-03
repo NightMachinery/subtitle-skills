@@ -435,6 +435,8 @@ class RequestPool:
         self._model_lock = threading.Lock()
         self._cooldown_lock = threading.Lock()
         self._cooldown_until = 0.0
+        self._fatal_error = None
+        self._fatal_lock = threading.Lock()
 
     def wait_for_cooldown(self):
         while True:
@@ -477,7 +479,10 @@ class RequestPool:
                 env = dict(os.environ, CLOUDSDK_CORE_DISABLE_FILE_LOGGING='true',
                            CLOUDSDK_CORE_DISABLE_USAGE_REPORTING='true')
                 try:
-                    result = subprocess.run([self.gcloud, 'auth', 'print-access-token'],
+                    # gcloud may otherwise return an old cached token with little
+                    # lifetime left. This acquisition timestamp must mean fresh auth.
+                    result = subprocess.run([self.gcloud, 'config', 'config-helper',
+                                             '--force-auth-refresh', '--format=value(credential.access_token)'],
                                             env=env, capture_output=True, text=True, check=True)
                 except (OSError, subprocess.CalledProcessError) as error:
                     raise SubtitleError('gcloud authentication failed') from error
@@ -486,6 +491,11 @@ class RequestPool:
                     raise SubtitleError('gcloud returned no access token')
                 self._token_acquired_at = self.clock()
             return self._token
+
+    def assert_running(self):
+        with self._fatal_lock:
+            if self._fatal_error is not None:
+                raise SubtitleError(self._fatal_error)
 
     def transcribe(self, audio, output, duration, configuration):
         if output.exists():
@@ -506,8 +516,11 @@ class RequestPool:
         for attempt in range(3):
             with self.limit:
                 while True:
+                    self.assert_running()
                     self.wait_for_cooldown()
+                    self.assert_running()
                     token = self.token()  # Refresh proactively, before submitting audio.
+                    self.assert_running()
                     with self._cooldown_lock:
                         # Authentication can outlast another thread's rejection.
                         if self.clock() < self._cooldown_until:
@@ -548,11 +561,15 @@ class RequestPool:
                                 self._token = None
                     if diagnostic['retry_scheduled']:
                         continue
+                    with self._fatal_lock:
+                        self._fatal_error = f'API request pool stopped after terminal rejection: {text}'
                     raise SubtitleError(f'API request failed: {text}') from None
                 except Exception as error:
                     audit['uncertain_outcomes'] += 1
                     audit['last_outcome'] = 'uncertain'
                     atomic_json(audit_path, audit)
+                    with self._fatal_lock:
+                        self._fatal_error = 'API request pool stopped after an uncertain outcome; inspect its checkpoint'
                     raise SubtitleError('API request outcome is uncertain; request was not replayed') from None
                 # Keep the raw response even if validation fails: never pay twice
                 # merely because formatting or API validation failed after success.

@@ -111,6 +111,12 @@ sanitized rejection categories and attempt counts. Old responses created before
 these audits remain usable, but their historical attempt totals are unknown.
 An HTTP 429 alone does not prove a particular numerical quota was exceeded.
 
+The shared pool obtains a fresh gcloud token and renews it proactively during
+long runs. Authentication rejection, exhausted retries or an unknown outcome
+stop queued audio requests. HTTP401 is never blindly retried. Inspect private
+request audits before deliberately resuming only missing sections. Already sent
+requests may finish; unknown outcomes retain their inflight markers.
+
 Resume the same command and cache after an interruption. Existing valid outputs
 are skipped before authentication
 or spend. Use `--overwrite` only when replacing them was requested. Use
