@@ -1,0 +1,4 @@
+# Copy to ~/.config/subtitle-creation/config.toml and supply your project.
+# Keep your real configuration outside the repository.
+[vertex]
+project = "YOUR_PROJECT_ID"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Subtitle Translation"
+  short_description: "Translate subtitles while preserving IDs and timings"
+  default_prompt: "Use $subtitle-translation to translate these subtitles into the requested language while preserving the source file and every cue timestamp."

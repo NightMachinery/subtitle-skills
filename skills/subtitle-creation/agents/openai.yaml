@@ -1,0 +1,4 @@
+interface:
+  display_name: "Subtitle Creation"
+  short_description: "Create original-language subtitles and English translations"
+  default_prompt: "Use $subtitle-creation to subtitle the requested media in its original language, adding English if needed and any other requested languages."
