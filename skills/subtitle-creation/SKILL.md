@@ -140,7 +140,9 @@ Workers must not edit the skill, commit files, or process unassigned episodes.
 
 If a saved raw response has an invalid word interval, halt further paid work.
 Keep that response intact. Recheck one bounded audio clip and preserve its raw
-response separately. Only when an indexed same-word recheck anchor supports
+response separately. Recheck anchors may differ only in trailing sentence
+punctuation (`.,;:!?`); preserve the original word text. Only when an indexed
+same-word recheck anchor supports
 both endpoints may an agent explicitly author a private adjacent
 `chunk-NNN.timing-overrides.json`. Its exact raw checksum, original word/offset
 identity, reviewer/reason and bounded audio evidence are validated before the

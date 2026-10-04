@@ -215,6 +215,36 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(corrections[0]['local_word_index'], 0)
         self.assertEqual(corrections[0]['evidence'], overlay['corrections'][0]['evidence'])
 
+    def test_timing_anchor_allows_only_trailing_sentence_punctuation(self):
+        path = self.directory / 'chunk-000.json'
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = '42,'
+        overlay = self.timing_overlay(path, raw=raw)
+        evidence = Path(overlay['corrections'][0]['evidence']['recheck_path'])
+        recheck = t.read_json(evidence)
+        recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = '42'
+        t.atomic_json(evidence, recheck)
+        overlay['corrections'][0]['evidence']['recheck_sha256'] = hashlib.sha256(evidence.read_bytes()).hexdigest()
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        before, evidence_before = path.read_bytes(), evidence.read_bytes()
+        data = t.read_checkpoint(path, 10)
+        word = data['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]
+        self.assertEqual(word['word'], '42,')
+        self.assertEqual((word['startOffset'], word['endOffset']), (0.2, 0.6))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(evidence.read_bytes(), evidence_before)
+        for original, anchor in [('42%', '42'), ('-42', '42'), ('4.2', '42'),
+                                 ("can't", 'cant'), ('Word', 'word'),
+                                 ('word', 'words'), ('!', '?'), ('42', None)]:
+            with self.subTest(original=original, anchor=anchor):
+                self.assertFalse(t.same_timing_word(original, anchor))
+        recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = '43'
+        t.atomic_json(evidence, recheck)
+        overlay['corrections'][0]['evidence']['recheck_sha256'] = hashlib.sha256(evidence.read_bytes()).hexdigest()
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 10)
+
     def test_timing_overlay_maps_bounded_clip_offsets_into_section_time(self):
         path = self.directory / 'chunk-000.json'
         overlay = self.timing_overlay(path)

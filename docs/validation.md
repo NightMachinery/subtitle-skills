@@ -66,7 +66,10 @@ an absolute existing `.json` raw audio-recheck response; its byte checksum must
 match. Clip boundaries use section-local seconds, are positive in duration,
 inside the original section, and at most 60 seconds apart. The complete recheck
 must finish successfully and all its word timings must fit the exact clip
-duration. The indexed anchor must have the same word text. Proposed endpoints
+duration. The indexed anchor must have the same word text, allowing only
+different trailing sentence punctuation (`.,;:!?`). Spelling, case, internal
+punctuation, numeric signs and percent symbols must still match. Original
+word text and both raw responses remain unchanged. Proposed endpoints
 must equal clip start plus its actual raw offsets, with only one microsecond of
 floating-point tolerance. Manual claims without this retained word anchor are
 not accepted.

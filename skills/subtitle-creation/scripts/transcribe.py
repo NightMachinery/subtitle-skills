@@ -297,6 +297,14 @@ def checkpoint_word(data, part_index, word_index):
     return word
 
 
+def same_timing_word(original, anchor):
+    """Ignore only trailing sentence punctuation in a bounded timing anchor."""
+    if not isinstance(original, str) or not isinstance(anchor, str):
+        return False
+    original, anchor = original.rstrip('.,;:!?'), anchor.rstrip('.,;:!?')
+    return bool(original) and original == anchor
+
+
 def timing_number(value):
     try:
         valid = type(value) in (int, float) and math.isfinite(value)
@@ -392,7 +400,7 @@ def _read_checkpoint(path, duration, include_corrections):
                 anchor = checkpoint_word(recheck, evidence['recheck_part_index'], evidence['recheck_word_index'])
             except (OSError, ValueError, UnicodeError, KeyError, TypeError, AttributeError):
                 raise SubtitleError('Timing override raw recheck evidence is malformed or unavailable') from None
-            if (anchor.get('word') != correction['word']
+            if (not same_timing_word(correction['word'], anchor.get('word'))
                     or not math.isclose(start, clip_start + offset(anchor.get('startOffset')), rel_tol=0, abs_tol=1e-6)
                     or not math.isclose(end, clip_start + offset(anchor.get('endOffset')), rel_tol=0, abs_tol=1e-6)):
                 raise SubtitleError('Timing override endpoints or word lack matching raw recheck support')
