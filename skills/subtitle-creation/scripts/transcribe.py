@@ -263,7 +263,7 @@ def offset(value):
     return number
 
 
-def timed_words(data, duration):
+def timed_words(data, duration, *, allow_empty=False):
     candidates = data.get('candidates', [])
     if not candidates or candidates[0].get('finishReason') != 'STOP':
         raise SubtitleError('Transcription did not finish normally')
@@ -279,7 +279,7 @@ def timed_words(data, duration):
                 raise SubtitleError('Word timestamp outside section timeline')
             words.append({'word': word.strip(), 'start': start, 'end': min(end, duration),
                           'speaker': str(raw.get('speakerLabel', transcript.get('speakerLabel', 'narrator')))})
-    if not words:
+    if not words and not allow_empty:
         raise SubtitleError('Transcription returned no timed words')
     return words
 
@@ -586,6 +586,163 @@ def reviewed_join(data, path, raw_bytes, duration):
                     'source_sha256': overlay['source_sha256'], 'local_word_index': local_index}
 
 
+
+def successful_parts(data):
+    """Strict successful raw response shape, permitting absent content for empty STOP."""
+    if not isinstance(data, dict) or 'error' in data:
+        raise SubtitleError('Non-speech review requires a successful raw response')
+    candidates = data.get('candidates')
+    if (not isinstance(candidates, list) or len(candidates) != 1
+            or not isinstance(candidates[0], dict) or candidates[0].get('finishReason') != 'STOP'
+            or data.get('promptFeedback', {}).get('blockReason')):
+        raise SubtitleError('Non-speech review requires one successful STOP candidate')
+    content = candidates[0].get('content', {})
+    if not isinstance(content, dict) or not isinstance(content.get('parts', []), list):
+        raise SubtitleError('Malformed non-speech response content')
+    parts = content.get('parts', [])
+    if any(not isinstance(part, dict) for part in parts):
+        raise SubtitleError('Malformed non-speech response part')
+    return parts
+
+
+def unique_json_object(pairs):
+    """Reject ambiguous duplicate fields in reviewed non-speech evidence."""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise SubtitleError('Duplicate JSON field in non-speech review')
+        result[key] = value
+    return result
+
+
+def exact_digital_silence(evidence, duration):
+    """Prove bounded full-clip 16-bit PCM is exactly zero, without VAD thresholds."""
+    if (not isinstance(evidence, dict)
+            or set(evidence) != {'kind', 'audio_path', 'audio_sha256'}
+            or evidence['kind'] != 'digital_silence'
+            or not isinstance(evidence['audio_path'], str)):
+        raise SubtitleError('Digital silence evidence schema is invalid')
+    path = Path(evidence['audio_path'])
+    if not path.is_absolute() or path.suffix.lower() != '.wav':
+        raise SubtitleError('Digital silence evidence must reference an absolute PCM WAV')
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    if digest.hexdigest() != evidence['audio_sha256']:
+        raise SubtitleError('Digital silence audio checksum is invalid')
+    try:
+        with wave.open(str(path), 'rb') as audio:
+            channels, width, rate, frames = (audio.getnchannels(), audio.getsampwidth(),
+                                            audio.getframerate(), audio.getnframes())
+            if (audio.getcomptype() != 'NONE' or width != 2 or channels not in (1, 2)
+                    or not 0 < rate <= 192000 or frames <= 0
+                    or not 0 < frames / rate <= 900 or not 0 < duration <= 900
+                    or abs(frames / rate - duration) > 1 / rate + 1e-12):
+                raise SubtitleError('Digital silence requires a complete bounded 16-bit PCM section')
+            remaining = frames
+            while remaining:
+                count = min(remaining, 65536)
+                block = audio.readframes(count)
+                if len(block) != count * channels * width or any(block):
+                    raise SubtitleError('Digital silence requires every retained PCM sample to be exactly zero')
+                remaining -= count
+    except (wave.Error, EOFError):
+        raise SubtitleError('Malformed digital silence WAV evidence') from None
+    return {'frame_count': frames, 'sample_rate': rate, 'channels': channels,
+            'sample_width_bytes': width, 'duration_seconds': frames / rate,
+            'all_sample_bytes_zero': True}
+
+
+def reviewed_non_speech(data, path, raw_bytes, duration):
+    """Authorize one genuinely empty section using retained, independently reviewed clips.
+
+    No classifier, replay, recursive checkpoint reader, or raw mutation occurs here.
+    """
+    overlay_path = path.with_suffix('.non-speech.json')
+    overlay = json.loads(overlay_path.read_bytes(), object_pairs_hook=unique_json_object)
+    data = json.loads(raw_bytes, object_pairs_hook=unique_json_object)
+    keys = {'version', 'source_sha256', 'reviewer', 'reason', 'evidence'}
+    if (not isinstance(overlay, dict) or set(overlay) != keys
+            or type(overlay['version']) is not int or overlay['version'] != 1
+            or overlay['source_sha256'] != hashlib.sha256(raw_bytes).hexdigest()
+            or any(not isinstance(overlay[field], str) or not overlay[field].strip()
+                   for field in ('reviewer', 'reason'))
+            or not isinstance(overlay['evidence'], (list, dict)) or not overlay['evidence']):
+        raise SubtitleError('Non-speech review schema or source checksum is invalid')
+    duration = timing_number(duration)
+    if duration <= 0:
+        raise SubtitleError('Non-speech review requires a positive section duration')
+    for part in successful_parts(data):
+        if 'text' in part and (not isinstance(part['text'], str) or part['text'].strip()):
+            raise SubtitleError('Non-speech review cannot discard untimed transcript text')
+        transcript = part.get('audioTranscription', {})
+        if not isinstance(transcript, dict) or not isinstance(transcript.get('words', []), list):
+            raise SubtitleError('Malformed empty audio transcription')
+        if transcript.get('words'):
+            raise SubtitleError('Non-speech review cannot discard timed words')
+        if any(key not in ('words', 'speakerLabel', 'text', 'transcript') for key in transcript):
+            raise SubtitleError('Unsupported empty audio transcription field')
+        if any(not isinstance(transcript[key], str) or transcript[key].strip()
+               for key in ('text', 'transcript') if key in transcript):
+            raise SubtitleError('Non-speech review cannot discard untimed transcript text')
+        if any(key not in ('text', 'audioTranscription', 'thought', 'thoughtSignature') for key in part):
+            raise SubtitleError('Unsupported non-speech response part')
+    correction = {'kind': 'reviewed_non_speech', **copy.deepcopy(overlay),
+                  'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve())}
+    if isinstance(overlay['evidence'], dict):
+        correction['digital_silence_proof'] = exact_digital_silence(overlay['evidence'], duration)
+        return correction
+    evidence_keys = {'recheck_path', 'recheck_sha256', 'clip_start_seconds',
+                     'clip_end_seconds', 'reviewed_no_speech'}
+    intervals, seen_paths, seen_hashes = [], set(), set()
+    for evidence in overlay['evidence']:
+        if (not isinstance(evidence, dict) or set(evidence) != evidence_keys
+                or evidence['reviewed_no_speech'] is not True
+                or not isinstance(evidence['recheck_path'], str)):
+            raise SubtitleError('Non-speech evidence schema is invalid')
+        start = timing_number(evidence['clip_start_seconds'])
+        end = timing_number(evidence['clip_end_seconds'])
+        if not 0 <= start < end <= duration or end - start > 60:
+            raise SubtitleError('Non-speech evidence clip must fit the section and at most 60 seconds')
+        recheck_path = Path(evidence['recheck_path'])
+        if not recheck_path.is_absolute() or recheck_path.suffix != '.json':
+            raise SubtitleError('Non-speech evidence must reference absolute raw JSON')
+        resolved = recheck_path.resolve()
+        recheck_bytes = recheck_path.read_bytes()
+        digest = hashlib.sha256(recheck_bytes).hexdigest()
+        if (resolved == path.resolve() or digest == overlay['source_sha256']
+                or resolved in seen_paths or digest in seen_hashes
+                or evidence['recheck_sha256'] != digest):
+            raise SubtitleError('Non-speech evidence must be independent, unique and checksum verified')
+        seen_paths.add(resolved)
+        seen_hashes.add(digest)
+        recheck = json.loads(recheck_bytes, object_pairs_hook=unique_json_object)
+        parts = successful_parts(recheck)
+        model = recheck.get('modelVersion', '')
+        if not isinstance(model, str) or not re.fullmatch(
+                r'gemini-[0-9]+(?:\.[0-9]+)*-flash(?:-(?:preview|exp|experimental)(?:-[0-9]+(?:-[0-9]+)*)?|-[0-9]+)?', model):
+            raise SubtitleError('Non-speech evidence requires a retained independent Flash response')
+        if any(('text' in part and not isinstance(part['text'], str))
+               or ('thought' in part and type(part['thought']) is not bool)
+               or any(key not in ('text', 'thought', 'thoughtSignature') for key in part)
+               for part in parts):
+            raise SubtitleError('Malformed Flash non-speech evidence content')
+        text = '\n'.join(part['text'] for part in parts
+                         if not part.get('thought') and isinstance(part.get('text'), str)).strip()
+        if not text or len(text) > 65536:
+            raise SubtitleError('Non-speech evidence requires retained nonempty Flash text')
+        intervals.append((start, end))
+    cursor = 0.0
+    for start, end in sorted(intervals):
+        if not math.isclose(start, cursor, rel_tol=0, abs_tol=1e-6):
+            raise SubtitleError('Non-speech evidence has a coverage gap or overlap')
+        cursor = end
+    if not math.isclose(cursor, duration, rel_tol=0, abs_tol=1e-6):
+        raise SubtitleError('Non-speech evidence must cover the entire section')
+    return correction
+
+
 def read_checkpoint(path, duration, include_corrections=False):
     """Validate immutable raw JSON, applying only explicitly verified private overlays.
 
@@ -612,8 +769,11 @@ def _read_checkpoint(path, duration, include_corrections):
     exclusion_path = path.with_suffix('.word-exclusions.json')
     join_path = path.with_suffix('.word-joins.json')
     filler_path = path.with_suffix('.filler-omissions.json')
-    if sum(item.exists() for item in (overlay_path, exclusion_path, join_path, filler_path)) > 1:
+    non_speech_path = path.with_suffix('.non-speech.json')
+    if sum(item.exists() for item in (overlay_path, exclusion_path, join_path, filler_path, non_speech_path)) > 1:
         raise SubtitleError('Reviewed overlays cannot coexist on one checkpoint')
+    if non_speech_path.exists():
+        adjustments.append(reviewed_non_speech(data, path, raw_bytes, duration))
     if filler_path.exists():
         data, adjustment = reviewed_filler_omission(data, path, raw_bytes, duration)
         adjustments.append(adjustment)
@@ -715,7 +875,7 @@ def _read_checkpoint(path, duration, include_corrections):
                     for index, item in zip(range(evidence['recheck_word_index'],
                                                 evidence['recheck_end_word_index'] + 1), anchors)]
     try:
-        timed_words(data, duration)
+        timed_words(data, duration, allow_empty=any(item['kind'] == 'reviewed_non_speech' for item in adjustments))
     except (TypeError, KeyError, AttributeError, ValueError):
         raise SubtitleError('Malformed transcript checkpoint') from None
     return (data, adjustments) if include_corrections else data
@@ -935,9 +1095,12 @@ class RequestPool:
             if self._fatal_error is not None:
                 raise SubtitleError(self._fatal_error)
 
-    def checked_checkpoint(self, path, duration):
+    def checked_checkpoint(self, path, duration, *, allow_non_speech=True):
         try:
-            return read_checkpoint(path, duration)
+            data = read_checkpoint(path, duration)
+            if not allow_non_speech:
+                timed_words(data, duration)
+            return data
         except SubtitleError:
             with self._fatal_lock:
                 self._fatal_error = 'API request pool stopped after transcript validation failed; inspect its checkpoint'
@@ -947,7 +1110,8 @@ class RequestPool:
         if (output.exists() or output.with_suffix('.timing-overrides.json').exists()
                 or output.with_suffix('.word-exclusions.json').exists()
                 or output.with_suffix('.word-joins.json').exists()
-                or output.with_suffix('.filler-omissions.json').exists()):
+                or output.with_suffix('.filler-omissions.json').exists()
+                or output.with_suffix('.non-speech.json').exists()):
             return self.checked_checkpoint(output, duration)
         if output.with_suffix('.inflight.json').exists():
             raise SubtitleError('Previous request outcome is uncertain; review its inflight checkpoint before retrying')
@@ -958,7 +1122,7 @@ class RequestPool:
         url = f'https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent'
         payload = payload_for(audio, configuration)
         return self.cached_request(output, url, payload,
-                                   lambda path: self.checked_checkpoint(path, duration))
+                                   lambda path: self.checked_checkpoint(path, duration, allow_non_speech=False))
 
     def cached_request(self, output, url, payload, validator):
         """Retain raw success before validation; never replay unknown outcomes."""
@@ -1443,7 +1607,8 @@ def process_episode(video, args, pool):
                     if (checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists()
                             or checkpoint.with_suffix('.word-exclusions.json').exists()
                             or checkpoint.with_suffix('.word-joins.json').exists()
-                            or checkpoint.with_suffix('.filler-omissions.json').exists()):
+                            or checkpoint.with_suffix('.filler-omissions.json').exists()
+                            or checkpoint.with_suffix('.non-speech.json').exists()):
                         data = read_checkpoint(checkpoint, chunk['end'] - chunk['start'])
                         results[index] = data
                     elif args.format_only:
@@ -1470,6 +1635,9 @@ def process_episode(video, args, pool):
                     data, adjustments = read_checkpoint(cache / f'chunk-{index:03}.json',
                                                         chunk['end'] - chunk['start'], include_corrections=True)
                     for adjustment in adjustments:
+                        if adjustment['kind'] == 'reviewed_non_speech':
+                            adjustment.update(section=index, global_start=chunk['start'], global_end=chunk['end'])
+                            continue
                         if adjustment['kind'] in ('reviewed_word_exclusion', 'reviewed_filler_omission'):
                             adjustment.update(section=index, global_start=chunk['start'] + offset(adjustment['raw_word']['startOffset']))
                             continue
@@ -1477,10 +1645,16 @@ def process_episode(video, args, pool):
                                           global_start=chunk['start'] + adjustment['start_seconds'],
                                           global_end=chunk['start'] + adjustment['end_seconds'])
                     overlay_corrections.extend(adjustments)
-                    for word in timed_words(data, chunk['end'] - chunk['start']):
+                    for word in timed_words(data, chunk['end'] - chunk['start'],
+                                            allow_empty=any(item['kind'] == 'reviewed_non_speech'
+                                                            for item in adjustments)):
                         word.update(start=word['start'] + chunk['start'], end=word['end'] + chunk['start'],
                                     speaker=f"{index}:{word['speaker']}", section=index, id=len(words))
                         words.append(word)
+                result.update(word_count=len(words), corrections=overlay_corrections,
+                              review_flags=copy.deepcopy(overlay_corrections))
+                if not words:
+                    raise SubtitleError('Episode contains no timed speech; empty subtitles are not published')
                 corrections, flags = repair_long_words(words, preparation['silences'],
                                                        reviewed_word_ids={item['word_id'] for item in overlay_corrections
                                                                           if item['kind'] in ('reviewed_timing_override', 'reviewed_word_join')})

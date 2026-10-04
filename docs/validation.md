@@ -268,3 +268,67 @@ indices, section and original global start, without an active omitted word ID.
 Timing, exclusion, join and filler overlays cannot coexist on one checkpoint;
 orphan overlays stop before requests. Synthetic offline tests cover acceptance,
 raw immutability, context bounds, schema/identity failures and provenance.
+
+
+## Explicit reviewed non-speech sections
+
+An empty successful response still stops the request pool by default. Preserve
+its raw checkpoint and request audit. Do not replay it automatically or create
+placeholder words or SRT cues. A private adjacent `chunk-NNN.non-speech.json`
+may explicitly confirm a genuinely non-speech section. Never create this overlay
+automatically, fabricate an absent raw response, or use it to discard speech.
+
+The closed schema contains exactly `version` (integer 1), `source_sha256`
+(SHA-256 of the original checkpoint bytes), nonempty `reviewer` and `reason`,
+and `evidence`. The source must contain exactly one successful STOP candidate,
+no error or blocked response, no words, and no nonempty part or transcription
+text. Absent content on an otherwise successful STOP response is eligible;
+malformed content, text-only transcription and partial responses are rejected.
+Timing, exclusion, join, filler and non-speech overlays cannot coexist. Orphan
+overlays stop before requests.
+
+Evidence has two alternatives:
+
+- A nonempty list of independently reviewed bounded Flash raw responses. Each
+  entry has exactly `recheck_path` (an absolute existing raw JSON path),
+  `recheck_sha256`, `clip_start_seconds`, `clip_end_seconds`, and
+  `reviewed_no_speech` (the JSON boolean `true`). Bounds are finite numeric
+  section-relative seconds, never booleans. Each clip has positive duration,
+  fits inside the section, and lasts at most 60 seconds. Together the clips
+  cover the whole section contiguously, with one microsecond of floating-point
+  tolerance. Gaps, overlaps, duplicate paths or raw responses, stale checksums
+  and self-evidence are rejected. Each immutable response must identify a
+  Gemini Flash model (excluding Lite), have one successful STOP candidate,
+  and retain nonempty nonthought text. The reviewer interprets all raw text;
+  the helper does not classify text or infer silence from a marker. If evidence
+  is unclear or reports speech, do not assert `reviewed_no_speech`.
+- An exact digital-silence proof, using the dictionary with exactly
+  `kind: "digital_silence"`, `audio_path` (absolute retained WAV path), and
+  `audio_sha256`. Verify the full section's extracted clip identity during
+  review. The helper checks its byte checksum and requires uncompressed 16-bit
+  PCM, one or two channels, a positive sample rate up to 192000 Hz, nonempty
+  complete frames, and a positive duration at most 900 seconds. WAV duration
+  must match the section within one sample frame. Every PCM byte must be zero;
+  even a single nonzero byte rejects the proof. This is exact digital silence,
+  not a low-energy threshold, VAD estimate, or inference about faint speech.
+  Check for this exact condition before considering a paid independent speech
+  check; a verified all-zero clip needs no Flash response.
+
+Only the explicitly verified section may contribute an empty word list.
+`timed_words` remains strict by default. Raw JSON, WAV and independent response
+bytes remain unchanged; usage and cache identity remain intact. Private
+`reviewed_non_speech` corrections and review flags retain the overlay, reviewer,
+reason, checksums, evidence, section and global bounds. Digital proofs also
+retain verified frame count, rate, channel count and zero-byte result. No word
+ID is assigned to a non-speech section. Evidence is read directly without
+recursive overlay application or network requests.
+
+Use `--format-only` to resume cached formatting after review. Other sections'
+words, timing, IDs and cues remain preserved. An episode with no timed speech
+fails without publishing an empty SRT, while retaining usage and review flags.
+Fresh empty API responses still stop queued work after saving successful raw
+JSON/audit and removing their inflight marker. Successful independent evidence
+never authorizes automatic replay. Synthetic tests cover both evidence forms,
+checksums, source/text protection, complete coverage, malformed responses,
+coexisting/orphan overlays, strict fresh-request failure, cached no-network
+resume, word preservation and whole-episode empty-output refusal.

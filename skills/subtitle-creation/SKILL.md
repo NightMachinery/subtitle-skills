@@ -148,6 +148,14 @@ both endpoints may an agent explicitly author a private adjacent
 identity, reviewer/reason and bounded audio evidence are validated before the
 runner applies offsets to an in-memory copy. Read the strict schema in
 [validation guidance](../../docs/validation.md#explicit-reviewed-timing-overlays).
+An empty successful transcript also stops queued requests. Retain its raw
+response and audit. Confirm a genuinely non-speech section only through the
+[private non-speech review contract](../../docs/validation.md#explicit-reviewed-non-speech-sections):
+full bounded independent Flash coverage, or an immutable full-section WAV of
+exactly zero PCM samples. Check for exact digital silence before considering a
+paid recheck. The helper never creates this overlay, replays audio automatically,
+invents words/cues, or publishes an episode containing no timed speech.
+
 For an explicit hyphenated ASCII telephone token split across recheck words,
 use the schema's optional indexed telephone span, preserving digits, any leading
 plus, and original text. Other multiword spans are rejected. For an indexed single ASCII digit and its

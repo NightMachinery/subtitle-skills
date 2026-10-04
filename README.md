@@ -96,6 +96,7 @@ python3 -B tests/test_models.py
 python3 -B tests/test_batch.py
 python3 -B tests/test_manage.py
 python3 -B tests/test_second_opinion.py
+python3 -B tests/test_non_speech.py
 ```
 
 The tests exercise source locks, resumability, bounded retries, model selection,
@@ -108,3 +109,10 @@ For test and maintenance guidance, see [validation](docs/validation.md).
 The creation skill also includes a bounded independent audio wording helper.
 See [audio second opinions](skills/subtitle-creation/references/audio-second-opinion.md)
 for latest-Flash selection, private evidence caching, and concurrency limits.
+
+
+Empty successful transcript sections stop requests until explicitly reviewed.
+The private non-speech overlay accepts full bounded Flash review coverage or a
+checksum-verified full section of exactly zero 16-bit PCM samples. It never
+inserts placeholder dialogue or publishes an empty episode SRT. See the
+[non-speech review contract](docs/validation.md#explicit-reviewed-non-speech-sections).
