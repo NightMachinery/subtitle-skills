@@ -354,6 +354,213 @@ class RunnerTests(unittest.TestCase):
         result = t.process_episode(video, args, self.pool(lambda *_: self.fail('invalid cached join allowed network')))
         self.assertEqual(result['status'], 'failed')
 
+    def filler_overlay(self, path, token='uh'):
+        raw = response()
+        words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+        words.insert(2, {'word': token, 'startOffset': '1.3s', 'endOffset': '1.1s', 'speakerLabel': '1'})
+        raw['candidates'][0]['content']['parts'][0]['text'] = 'A small ' + token + ' offline test.'
+        t.atomic_json(path, raw)
+        recheck = path.parent / 'synthetic-filler-recheck.json'
+        t.atomic_json(recheck, response())
+        overlay = {'version': 1, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                   'omissions': [{'part_index': 0, 'word_index': 2, 'raw_word': copy.deepcopy(words[2]),
+                     'reviewer': 'synthetic reviewer', 'reason': 'explicit disfluency cleanup with retained context',
+                     'evidence': {'recheck_path': str(recheck.resolve()),
+                       'recheck_sha256': hashlib.sha256(recheck.read_bytes()).hexdigest(),
+                       'clip_start_seconds': 0, 'clip_end_seconds': 10, 'recheck_part_index': 0,
+                       'before_word_index': 1, 'after_word_index': 2}}]}
+        t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+        return overlay, recheck
+
+    def test_reviewed_filler_omission_preserves_raw_and_canonical_word_order(self):
+        for token in ('uh', 'um'):
+            with self.subTest(token=token):
+                video, args, cache = fixture(self.directory)
+                path = cache / 'chunk-000.json'
+                overlay, recheck = self.filler_overlay(path, token)
+                raw_bytes, recheck_bytes = path.read_bytes(), recheck.read_bytes()
+                original = json.loads(raw_bytes)
+                expected = copy.deepcopy(original)
+                del expected['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][2]
+                copied, audit = t.read_checkpoint(path, 10, include_corrections=True)
+                self.assertEqual(copied, expected)
+                self.assertEqual(original, json.loads(raw_bytes))
+                args.format_only = True
+                video.with_suffix('.en.srt').unlink(missing_ok=True)
+                result = t.process_episode(video, args, self.pool(lambda *_: self.fail('network called')))
+                self.assertEqual(result['status'], 'completed')
+                omission = result['corrections'][0]
+                self.assertEqual(omission['kind'], 'reviewed_filler_omission')
+                self.assertEqual(omission['raw_word'], overlay['omissions'][0]['raw_word'])
+                self.assertEqual(omission['evidence'], overlay['omissions'][0]['evidence'])
+                self.assertEqual(omission['global_start'], 1.3)
+                self.assertEqual(omission['section'], 0)
+                self.assertNotIn('word_id', omission)
+                self.assertEqual(result['review_flags'][0], omission)
+                self.assertEqual(result['word_count'], 4)
+                self.assertIn('A small offline test.', video.with_suffix('.en.srt').read_text())
+                self.assertEqual(path.read_bytes(), raw_bytes)
+                self.assertEqual(recheck.read_bytes(), recheck_bytes)
+                self.assertEqual(t.FORMAT_VERSION, 1)
+
+    def test_filler_omission_rejects_schema_identity_indices_and_bounds(self):
+        path = self.directory / 'chunk-000.json'
+        changes = [lambda o: o.update(version=True), lambda o: o.update(source_sha256='stale'),
+                   lambda o: o.update(extra=1), lambda o: o['omissions'].append(copy.deepcopy(o['omissions'][0])),
+                   lambda o: o['omissions'][0].update(part_index=True),
+                   lambda o: o['omissions'][0].update(word_index=True),
+                   lambda o: o['omissions'][0].update(word_index=-1),
+                   lambda o: o['omissions'][0].update(word_index=0),
+                   lambda o: o['omissions'][0].update(word_index=999),
+                   lambda o: o['omissions'][0].update(reviewer=' '),
+                   lambda o: o['omissions'][0].update(extra=1),
+                   lambda o: o['omissions'][0]['raw_word'].update(extra=1),
+                   lambda o: o['omissions'][0]['evidence'].update(extra=1),
+                   lambda o: o['omissions'][0]['evidence'].update(recheck_sha256='stale'),
+                   lambda o: o['omissions'][0]['evidence'].update(recheck_path='relative.json'),
+                   lambda o: o['omissions'][0]['evidence'].update(clip_start_seconds=float('nan')),
+                   lambda o: o['omissions'][0]['evidence'].update(clip_end_seconds=11),
+                   lambda o: o['omissions'][0]['evidence'].update(clip_start_seconds=1.2),
+                   lambda o: o['omissions'][0]['evidence'].update(recheck_part_index=True),
+                   lambda o: o['omissions'][0]['evidence'].update(recheck_part_index=1),
+                   lambda o: o['omissions'][0]['evidence'].update(before_word_index=True),
+                   lambda o: o['omissions'][0]['evidence'].update(after_word_index=3)]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                overlay, _ = self.filler_overlay(path)
+                change(overlay)
+                path.with_suffix('.filler-omissions.json').write_text(json.dumps(overlay))
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_filler_omission_protects_other_words_and_valid_intervals(self):
+        path = self.directory / 'chunk-000.json'
+        changes = [{'word': word} for word in ('Uh', 'uh.', 'umm', 'substantive', 'UM')] + [
+                   {'startOffset': '1.1s', 'endOffset': '1.3s'},
+                   {'startOffset': '1.8s', 'endOffset': '1.1s'},
+                   {'startOffset': 'NaNs'}, {'endOffset': '-0.1s'},
+                   {'startOffset': '11s'}, {'speakerLabel': 'different'}]
+        for change in changes:
+            with self.subTest(change=change):
+                overlay, _ = self.filler_overlay(path)
+                raw = t.read_json(path)
+                target = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][2]
+                target.update(change)
+                t.atomic_json(path, raw)
+                overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                overlay['omissions'][0]['raw_word'] = copy.deepcopy(target)
+                t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_filler_omission_requires_successful_retained_context(self):
+        path = self.directory / 'chunk-000.json'
+        def words(raw):
+            return raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+        changes = [lambda r: r['candidates'][0].update(finishReason='MAX_TOKENS'),
+                   lambda r: r.update(candidates=[]),
+                   lambda r: words(r)[1].update(word='different'),
+                   lambda r: words(r)[2].update(word='uh'),
+                   lambda r: words(r)[0].update(word='uh.'),
+                   lambda r: words(r)[1].update(startOffset='0.2s'),
+                   lambda r: words(r)[2].update(endOffset='2.3s'),
+                   lambda r: words(r)[0].update(endOffset='10.1s'),
+                   lambda r: words(r)[0].update(startOffset='NaNs'),
+                   lambda r: words(r)[0].update(startOffset='0.8s'),
+                   lambda r: r['candidates'][0]['content']['parts'][0].update(text='small uh offline'),
+                   lambda r: r['candidates'][0]['content']['parts'][0]['audioTranscription'].update(text='small UH offline'),
+                   lambda r: words(r).insert(2, {'word': 'other', 'startOffset': '1.2s', 'endOffset': '1.3s'})]
+        for change in changes:
+            with self.subTest(change=changes.index(change)):
+                overlay, recheck = self.filler_overlay(path)
+                raw = t.read_json(recheck)
+                change(raw)
+                t.atomic_json(recheck, raw)
+                overlay['omissions'][0]['evidence']['recheck_sha256'] = hashlib.sha256(recheck.read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        overlay, recheck = self.filler_overlay(path)
+        recheck.unlink()
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 10)
+
+    def test_filler_omission_requires_substantive_immediate_same_part_neighbors(self):
+        path = self.directory / 'chunk-000.json'
+        for mode in ('missing_after', 'cross_part_after', 'filler_before', 'invalid_before'):
+            with self.subTest(mode=mode):
+                overlay, _ = self.filler_overlay(path)
+                raw = t.read_json(path)
+                parts = raw['candidates'][0]['content']['parts']
+                words = parts[0]['audioTranscription']['words']
+                if mode in ('missing_after', 'cross_part_after'):
+                    tail = words[3:]
+                    del words[3:]
+                    if mode == 'cross_part_after':
+                        parts.append({'audioTranscription': {'words': tail}})
+                elif mode == 'filler_before':
+                    words[1]['word'] = 'um'
+                else:
+                    words[1]['startOffset'] = '1.4s'
+                t.atomic_json(path, raw)
+                overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        self.filler_overlay(path)
+        path.with_suffix('.filler-omissions.json').unlink()
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 10)
+
+    def test_filler_omission_recorded_permission_requires_no_recheck(self):
+        path = self.directory / 'chunk-000.json'
+        for token in ('uh', 'um'):
+            overlay, recheck = self.filler_overlay(path, token)
+            recheck.unlink()
+            permission = {'user_permission': 'Synthetic request: omit disfluencies from these subtitles.'}
+            overlay['omissions'][0]['evidence'] = permission
+            t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+            raw_bytes = path.read_bytes()
+            copied, audit = t.read_checkpoint(path, 10, include_corrections=True)
+            self.assertEqual(audit[0]['evidence'], permission)
+            self.assertEqual([w['word'] for w in copied['candidates'][0]['content']['parts'][0]['audioTranscription']['words']],
+                             ['A', 'small', 'offline', 'test.'])
+            self.assertEqual(path.read_bytes(), raw_bytes)
+            for invalid in ({'user_permission': ''}, {'user_permission': ' '}, {'user_permission': True},
+                            {'user_permission': 1}, {'user_permission': permission['user_permission'], 'extra': 1},
+                            {'user_permission': permission['user_permission'], 'recheck_path': '/synthetic.json'}):
+                overlay['omissions'][0]['evidence'] = invalid
+                t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        for change in ({'word': 'protected'}, {'startOffset': '1.1s', 'endOffset': '1.3s'}):
+            overlay, _ = self.filler_overlay(path)
+            raw = t.read_json(path)
+            target = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][2]
+            target.update(change)
+            t.atomic_json(path, raw)
+            overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+            overlay['omissions'][0].update(raw_word=copy.deepcopy(target), evidence=permission)
+            t.atomic_json(path.with_suffix('.filler-omissions.json'), overlay)
+            with self.assertRaises(t.SubtitleError):
+                t.read_checkpoint(path, 10)
+
+    def test_filler_omission_rejects_coexisting_and_orphan_overlays(self):
+        for suffix in ('.timing-overrides.json', '.word-exclusions.json', '.word-joins.json'):
+            with self.subTest(suffix=suffix):
+                video, args, cache = fixture(self.directory)
+                path = cache / 'chunk-000.json'
+                self.filler_overlay(path)
+                t.atomic_json(path.with_suffix(suffix), {})
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+                path.with_suffix(suffix).unlink()
+                path.unlink()
+                result = t.process_episode(video, args, self.pool(lambda *_: self.fail('orphan allowed network')))
+                self.assertEqual(result['status'], 'failed')
+                with self.assertRaises(t.SubtitleError):
+                    self.pool(lambda *_: self.fail('orphan allowed network')).transcribe(b'offline', path, 10, t.settings(args))
+
     def exclusion_overlay(self, path):
         raw = response()
         words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']

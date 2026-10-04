@@ -169,6 +169,14 @@ in-memory word list. It cannot exclude spoken words or coexist with a timing
 overlay. Follow the [strict exclusion schema](../../docs/validation.md#explicit-reviewed-terminal-artifact-exclusion).
 Never generate exclusions automatically; stop if audio evidence is uncertain.
 
+For explicit user permission to omit disfluencies or requested disfluency cleanup,
+[validation.md](../../docs/validation.md#explicit-reviewed-malformed-filler-omission)
+describes the narrowly reviewed `uh`/`um` malformed-filler omission overlay.
+Verbatim stays the default. Record explicit user permission privately; retained
+bounded context is optional. Never request a paid recheck solely to remove fillers.
+This is editorial omission, not evidence
+that the filler was never uttered. The helper does not generate overlays.
+
 For adjacent decimal and `%` entries whose touching percent interval is reversed,
 an explicit private `chunk-NNN.word-joins.json` may join their exact characters
 only when an indexed bounded raw audio recheck supports both merged endpoints.

@@ -218,3 +218,53 @@ The shared request loop retains the existing transcription overlay validation.
 
 Synthetic repository and symlink tests verify that audio opinion evidence cannot
 be cached inside public skill sources, before any media probe or cache write.
+
+
+## Explicit reviewed malformed filler omission
+
+Verbatim remains the default. Only explicit user permission to omit disfluencies
+or requested disfluency cleanup permits the private adjacent
+`chunk-NNN.filler-omissions.json` overlay. The helper never generates this file.
+Recorded explicit permission suffices without audio evidence. Do not request a
+paid recheck solely to remove a filler. Existing retained bounded evidence is an
+optional alternative when it meets the checks below. Context supports editorial omission,
+not a claim that the filler was never uttered.
+
+The closed schema has exactly `version` (integer 1), `source_sha256` (immutable
+raw checkpoint SHA-256), and `omissions` (exactly one entry). That entry has exactly
+`part_index`, `word_index`, `raw_word` (complete exact original dictionary),
+`reviewer`, `reason`, and `evidence`. Indices are nonnegative integers, never
+booleans; reviewer and reason are nonempty strings. Only exact lowercase ASCII
+`uh` or `um` with finite reversed endpoints inside the section and reversal
+width at most 0.5 seconds qualifies. Properly timed fillers and every other word
+are protected. Immediate same-part neighbors must have valid intervals and
+substantive words, with no resolved speaker change.
+
+Evidence uses one of two closed schemas. The permission-only schema is exactly
+`{"user_permission": "nonempty recorded user request"}` and preserves that complete
+request in private provenance. It permits editorial omission without claiming
+that the filler was nonspoken or audio-confirmed. Mixed schemas and unknown keys
+are rejected. Both modes enforce the same exact raw identity, malformed interval,
+and valid immediate substantive neighbors.
+
+The optional retained-context schema has exactly `recheck_path` (absolute JSON path), `recheck_sha256`,
+`clip_start_seconds`, `clip_end_seconds`, `recheck_part_index`,
+`before_word_index`, and `after_word_index`. The section-local clip is positive,
+at most 60 seconds, and covers both full neighboring intervals and both reversed
+filler offsets. The retained successful STOP response must pass timed-word
+validation and fit the exact clip. Its two indexed anchors must be consecutive
+in one part, match both immediate original neighbors (only trailing sentence
+punctuation may differ), and have all adjusted endpoints within 0.5 seconds of
+the originals. The anchor gap must be between zero and one second. All recheck
+word lists must omit the target filler; matching standalone filler text in
+part text or transcription text also rejects the evidence.
+
+Only one copied word-list entry is removed. Original text, other word dictionaries,
+speakers, timestamps, usage, cache identity, raw checkpoint bytes and retained
+recheck bytes remain unchanged. Remaining active word IDs are regenerated in
+original order. Private `reviewed_filler_omission` provenance and final review
+flags preserve the complete raw identity, evidence, hashes, paths, original
+indices, section and original global start, without an active omitted word ID.
+Timing, exclusion, join and filler overlays cannot coexist on one checkpoint;
+orphan overlays stop before requests. Synthetic offline tests cover acceptance,
+raw immutability, context bounds, schema/identity failures and provenance.

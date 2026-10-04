@@ -430,6 +430,91 @@ def reviewed_exclusion(data, path, raw_bytes, duration):
                     'source_sha256': overlay['source_sha256']}
 
 
+def reviewed_filler_omission(data, path, raw_bytes, duration):
+    """Omit one explicitly reviewed malformed filler; preserve immutable raw evidence."""
+    overlay_path = path.with_suffix('.filler-omissions.json')
+    overlay = read_json(overlay_path)
+    if (not isinstance(overlay, dict) or set(overlay) != {'version', 'source_sha256', 'omissions'}
+            or type(overlay['version']) is not int or overlay['version'] != 1
+            or overlay['source_sha256'] != hashlib.sha256(raw_bytes).hexdigest()
+            or not isinstance(overlay['omissions'], list) or len(overlay['omissions']) != 1):
+        raise SubtitleError('Filler omission schema or raw checksum is invalid')
+    entry = overlay['omissions'][0]
+    if not isinstance(entry, dict) or set(entry) != {'part_index', 'word_index', 'raw_word', 'reviewer', 'reason', 'evidence'}:
+        raise SubtitleError('Filler omission entry schema is invalid')
+    target = checkpoint_word(data, entry['part_index'], entry['word_index'])
+    if (not isinstance(entry['raw_word'], dict)
+            or json.dumps(entry['raw_word'], sort_keys=True) != json.dumps(target, sort_keys=True)
+            or target.get('word') not in ('uh', 'um')):
+        raise SubtitleError('Filler omission requires an exact lowercase ASCII filler identity')
+    start, end = offset(target.get('startOffset')), offset(target.get('endOffset'))
+    if not (0 <= end < start <= duration and start - end <= 0.5):
+        raise SubtitleError('Filler omission requires a narrowly reversed interval within the section')
+    if any(not isinstance(entry[field], str) or not entry[field].strip() for field in ('reviewer', 'reason')):
+        raise SubtitleError('Filler omission reviewer and reason are required')
+    pi, wi = entry['part_index'], entry['word_index']
+    if wi == 0:
+        raise SubtitleError('Filler omission requires immediate same-part neighbors')
+    neighbors = [checkpoint_word(data, pi, index) for index in (wi - 1, wi + 1)]
+    transcript = data['candidates'][0]['content']['parts'][pi]['audioTranscription']
+    speakers = [str(word.get('speakerLabel', transcript.get('speakerLabel', 'narrator')))
+                for word in [neighbors[0], target, neighbors[1]]]
+    if len(set(speakers)) != 1:
+        raise SubtitleError('Filler omission cannot cross a speaker change')
+    for word in neighbors:
+        if (not isinstance(word.get('word'), str) or not word['word'].strip()
+                or word['word'].rstrip('.,;:!?').lower() in ('uh', 'um')
+                or not 0 <= offset(word.get('startOffset')) <= offset(word.get('endOffset')) <= duration):
+            raise SubtitleError('Filler omission requires substantive valid neighbors')
+    evidence = entry['evidence']
+    if isinstance(evidence, dict) and set(evidence) == {'user_permission'}:
+        if not isinstance(evidence['user_permission'], str) or not evidence['user_permission'].strip():
+            raise SubtitleError('Filler omission requires a nonempty recorded user permission')
+    else:
+        if not isinstance(evidence, dict) or set(evidence) != {
+                'recheck_path', 'recheck_sha256', 'clip_start_seconds', 'clip_end_seconds',
+                'recheck_part_index', 'before_word_index', 'after_word_index'}:
+            raise SubtitleError('Filler omission bounded evidence schema is invalid')
+        clip_start, clip_end = (timing_number(evidence[field]) for field in ('clip_start_seconds', 'clip_end_seconds'))
+        if (not 0 <= clip_start < clip_end <= duration or clip_end - clip_start > 60
+                or any(not clip_start <= value <= clip_end for value in [start, end] +
+                       [offset(word[key]) for word in neighbors for key in ('startOffset', 'endOffset')])):
+            raise SubtitleError('Filler omission clip must cover the full original context')
+        if (not isinstance(evidence['recheck_path'], str) or not Path(evidence['recheck_path']).is_absolute()
+                or Path(evidence['recheck_path']).suffix != '.json' or not isinstance(evidence['recheck_sha256'], str)):
+            raise SubtitleError('Filler omission requires an absolute raw recheck JSON path and checksum')
+        recheck_bytes = Path(evidence['recheck_path']).read_bytes()
+        if evidence['recheck_sha256'] != hashlib.sha256(recheck_bytes).hexdigest():
+            raise SubtitleError('Filler omission raw recheck checksum changed')
+        recheck = json.loads(recheck_bytes)
+        timed_words(recheck, clip_end - clip_start)
+        for part in recheck['candidates'][0]['content']['parts']:
+            rt = part.get('audioTranscription', {})
+            if any(isinstance(value, str) and re.search(r'(?<!\w)' + target['word'] + r'(?!\w)', value, re.IGNORECASE)
+                   for value in (part.get('text'), rt.get('text'))):
+                raise SubtitleError('Filler omission recheck text contradicts omission')
+            for word in rt.get('words', []):
+                if (not 0 <= offset(word['startOffset']) <= offset(word['endOffset']) <= clip_end - clip_start
+                        or same_timing_word(target['word'], word['word'].lower())):
+                    raise SubtitleError('Filler omission recheck contains the filler or invalid timing')
+        indices = [evidence[field] for field in ('recheck_part_index', 'before_word_index', 'after_word_index')]
+        if any(type(index) is not int or index < 0 for index in indices) or indices[2] != indices[1] + 1:
+            raise SubtitleError('Filler omission requires consecutive same-part integer anchors')
+        anchors = [checkpoint_word(recheck, indices[0], index) for index in indices[1:]]
+        if any(not same_timing_word(original['word'], anchor['word'])
+               or any(abs(clip_start + offset(anchor[key]) - offset(original[key])) > 0.5
+                      for key in ('startOffset', 'endOffset')) for original, anchor in zip(neighbors, anchors)):
+            raise SubtitleError('Filler omission anchors do not match the original context')
+        gap = offset(anchors[1]['startOffset']) - offset(anchors[0]['endOffset'])
+        if not 0 <= gap <= 1:
+            raise SubtitleError('Filler omission anchor gap is invalid')
+    copied = copy.deepcopy(data)
+    del copied['candidates'][0]['content']['parts'][pi]['audioTranscription']['words'][wi]
+    return copied, {'kind': 'reviewed_filler_omission', **copy.deepcopy(entry),
+                    'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve()),
+                    'source_sha256': overlay['source_sha256']}
+
+
 def reviewed_join(data, path, raw_bytes, duration):
     """Join one audio-verified malformed decimal/percent pair in a private copy."""
     overlay_path = path.with_suffix('.word-joins.json')
@@ -526,8 +611,12 @@ def _read_checkpoint(path, duration, include_corrections):
     overlay_path = path.with_suffix('.timing-overrides.json')
     exclusion_path = path.with_suffix('.word-exclusions.json')
     join_path = path.with_suffix('.word-joins.json')
-    if sum(item.exists() for item in (overlay_path, exclusion_path, join_path)) > 1:
+    filler_path = path.with_suffix('.filler-omissions.json')
+    if sum(item.exists() for item in (overlay_path, exclusion_path, join_path, filler_path)) > 1:
         raise SubtitleError('Reviewed overlays cannot coexist on one checkpoint')
+    if filler_path.exists():
+        data, adjustment = reviewed_filler_omission(data, path, raw_bytes, duration)
+        adjustments.append(adjustment)
     if join_path.exists():
         data, adjustment = reviewed_join(data, path, raw_bytes, duration)
         adjustments.append(adjustment)
@@ -857,7 +946,8 @@ class RequestPool:
     def transcribe(self, audio, output, duration, configuration):
         if (output.exists() or output.with_suffix('.timing-overrides.json').exists()
                 or output.with_suffix('.word-exclusions.json').exists()
-                or output.with_suffix('.word-joins.json').exists()):
+                or output.with_suffix('.word-joins.json').exists()
+                or output.with_suffix('.filler-omissions.json').exists()):
             return self.checked_checkpoint(output, duration)
         if output.with_suffix('.inflight.json').exists():
             raise SubtitleError('Previous request outcome is uncertain; review its inflight checkpoint before retrying')
@@ -1352,7 +1442,8 @@ def process_episode(video, args, pool):
                     checkpoint = cache / f'chunk-{index:03}.json'
                     if (checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists()
                             or checkpoint.with_suffix('.word-exclusions.json').exists()
-                            or checkpoint.with_suffix('.word-joins.json').exists()):
+                            or checkpoint.with_suffix('.word-joins.json').exists()
+                            or checkpoint.with_suffix('.filler-omissions.json').exists()):
                         data = read_checkpoint(checkpoint, chunk['end'] - chunk['start'])
                         results[index] = data
                     elif args.format_only:
@@ -1379,7 +1470,7 @@ def process_episode(video, args, pool):
                     data, adjustments = read_checkpoint(cache / f'chunk-{index:03}.json',
                                                         chunk['end'] - chunk['start'], include_corrections=True)
                     for adjustment in adjustments:
-                        if adjustment['kind'] == 'reviewed_word_exclusion':
+                        if adjustment['kind'] in ('reviewed_word_exclusion', 'reviewed_filler_omission'):
                             adjustment.update(section=index, global_start=chunk['start'] + offset(adjustment['raw_word']['startOffset']))
                             continue
                         adjustment.update(section=index, word_id=len(words) + adjustment['local_word_index'],
