@@ -99,3 +99,29 @@ formatting for unapproved outputs after a supported overlay is reviewed.
 Transcription settings and cache identity are unchanged. Synthetic offline
 tests cover anchor verification, exact identity, malformed evidence, byte
 preservation, private provenance, format-only reuse and queued cancellation.
+
+## Explicit reviewed terminal artifact exclusion
+
+A private adjacent `chunk-NNN.word-exclusions.json` may exclude exactly one
+terminal malformed speaker token matching `uid:[0-9]+`, with a valid start and
+missing `endOffset`. Spoken words, complete tokens and nonterminal entries are
+rejected. Never generate an overlay automatically or guess from token appearance.
+Preserve both raw responses. Stop when bounded successful audio evidence is uncertain.
+
+The closed schema is `version: 1`, `source_sha256`, and `exclusions` containing
+exactly one object: `part_index`, `word_index` (nonnegative integer indices),
+`raw_word` (the complete exact raw dictionary, including missing fields),
+nonempty `reviewer` and `reason`, and `evidence`. Evidence contains exactly
+`recheck_path` (absolute raw JSON path), `recheck_sha256`, `clip_start_seconds`
+and `clip_end_seconds`. The clip is at most 60 seconds, inside the section,
+ends at its end, and covers the token and preceding three word starts. The raw
+recheck must finish with STOP, have all timestamps strictly inside the clip,
+contain no speaker token, and end with at least three valid words matching those
+preceding original words (only trailing sentence punctuation may differ).
+Unknown keys, stale checksums and concurrent timing overlays stop processing.
+
+Only a copied word-list entry is removed. Raw bytes, text, remaining words,
+speakers, timestamps, usage and cache identity stay intact. Private corrections
+and flags retain exact target identity, evidence, paths, checksum, section and
+global start; a removed entry has no active word ID. Use `--format-only` for
+reviewed cached formatting, preserving approved outputs and avoiding paid replay.

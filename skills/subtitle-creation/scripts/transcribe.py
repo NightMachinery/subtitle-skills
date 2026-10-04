@@ -315,8 +315,73 @@ def timing_number(value):
     return value
 
 
+def reviewed_exclusion(data, path, raw_bytes, duration):
+    """Remove only a verified terminal malformed speaker token in a private copy."""
+    overlay_path = path.with_suffix('.word-exclusions.json')
+    overlay = read_json(overlay_path)
+    if (not isinstance(overlay, dict) or set(overlay) != {'version', 'source_sha256', 'exclusions'}
+            or type(overlay['version']) is not int or overlay['version'] != 1
+            or overlay['source_sha256'] != hashlib.sha256(raw_bytes).hexdigest()
+            or not isinstance(overlay['exclusions'], list) or len(overlay['exclusions']) != 1):
+        raise SubtitleError('Word exclusion schema or raw checksum is invalid')
+    entry = overlay['exclusions'][0]
+    if not isinstance(entry, dict) or set(entry) != {'part_index', 'word_index', 'raw_word', 'reviewer', 'reason', 'evidence'}:
+        raise SubtitleError('Word exclusion entry schema is invalid')
+    target = checkpoint_word(data, entry['part_index'], entry['word_index'])
+    if (not isinstance(entry['raw_word'], dict)
+            or json.dumps(entry['raw_word'], sort_keys=True) != json.dumps(target, sort_keys=True)
+            or not isinstance(target.get('word'), str) or re.fullmatch(r'uid:[0-9]+', target['word']) is None
+            or 'endOffset' in target):
+        raise SubtitleError('Word exclusion requires the exact malformed speaker token')
+    start = offset(target.get('startOffset'))
+    if not 0 <= start <= duration:
+        raise SubtitleError('Word exclusion token start is outside the section')
+    parts = data['candidates'][0]['content']['parts']
+    indexed = [(pi, wi, word) for pi, part in enumerate(parts)
+               for wi, word in enumerate(part.get('audioTranscription', {}).get('words', []))]
+    if len(indexed) < 4 or indexed[-1][:2] != (entry['part_index'], entry['word_index']):
+        raise SubtitleError('Word exclusion target must be the terminal timed-word entry')
+    if any(not isinstance(entry[field], str) or not entry[field].strip() for field in ('reviewer', 'reason')):
+        raise SubtitleError('Word exclusion reviewer and reason are required')
+    evidence = entry['evidence']
+    if not isinstance(evidence, dict) or set(evidence) != {'recheck_path', 'recheck_sha256', 'clip_start_seconds', 'clip_end_seconds'}:
+        raise SubtitleError('Word exclusion bounded evidence is incomplete')
+    clip_start, clip_end = (timing_number(evidence[field]) for field in ('clip_start_seconds', 'clip_end_seconds'))
+    if (not 0 <= clip_start < clip_end <= duration or clip_end - clip_start > 60
+            or not math.isclose(clip_end, duration, rel_tol=0, abs_tol=1e-6)
+            or not clip_start <= start <= clip_end):
+        raise SubtitleError('Word exclusion requires a bounded clip covering the section end and token')
+    if (not isinstance(evidence['recheck_path'], str) or not Path(evidence['recheck_path']).is_absolute()
+            or Path(evidence['recheck_path']).suffix != '.json' or not isinstance(evidence['recheck_sha256'], str)):
+        raise SubtitleError('Word exclusion requires an absolute raw recheck JSON path and checksum')
+    recheck_bytes = Path(evidence['recheck_path']).read_bytes()
+    if evidence['recheck_sha256'] != hashlib.sha256(recheck_bytes).hexdigest():
+        raise SubtitleError('Word exclusion raw recheck checksum changed')
+    recheck = json.loads(recheck_bytes)
+    checked = timed_words(recheck, clip_end - clip_start)
+    for part in recheck['candidates'][0]['content']['parts']:
+        transcript = part.get('audioTranscription', {})
+        if any(isinstance(value, str) and re.search(r'(?<![\w:])uid:[0-9]+(?![\w:])', value)
+               for value in (part.get('text'), transcript.get('text'))):
+            raise SubtitleError('Word exclusion recheck text contains a speaker token')
+        for word in part.get('audioTranscription', {}).get('words', []):
+            if (not 0 <= offset(word['startOffset']) <= offset(word['endOffset']) <= clip_end - clip_start
+                    or re.fullmatch(r'uid:[0-9]+', word['word']) is not None):
+                raise SubtitleError('Word exclusion recheck has invalid timing or a speaker token')
+    preceding = [item[2] for item in indexed[-4:-1]]
+    if (len(checked) < 3 or any(not same_timing_word(original.get('word'), anchor['word'])
+            or not clip_start <= offset(original.get('startOffset')) <= clip_end
+            for original, anchor in zip(preceding, checked[-3:]))):
+        raise SubtitleError('Word exclusion lacks the final three matching audio anchors')
+    copied = copy.deepcopy(data)
+    del copied['candidates'][0]['content']['parts'][entry['part_index']]['audioTranscription']['words'][entry['word_index']]
+    return copied, {'kind': 'reviewed_word_exclusion', **copy.deepcopy(entry),
+                    'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve()),
+                    'source_sha256': overlay['source_sha256']}
+
+
 def read_checkpoint(path, duration, include_corrections=False):
-    """Validate immutable raw JSON, applying only explicitly verified timing overlays.
+    """Validate immutable raw JSON, applying only explicitly verified private overlays.
 
     By default returns transcript data. include_corrections returns (data, audit).
     The audit contains private paths and reviewer evidence; never publish it.
@@ -338,6 +403,12 @@ def _read_checkpoint(path, duration, include_corrections):
         raise SubtitleError('Missing or invalid transcript checkpoint') from None
     adjustments = []
     overlay_path = path.with_suffix('.timing-overrides.json')
+    exclusion_path = path.with_suffix('.word-exclusions.json')
+    if overlay_path.exists() and exclusion_path.exists():
+        raise SubtitleError('Timing and word exclusion overlays cannot coexist')
+    if exclusion_path.exists():
+        data, adjustment = reviewed_exclusion(data, path, raw_bytes, duration)
+        adjustments.append(adjustment)
     if overlay_path.exists():
         overlay = read_json(overlay_path)
         if (not isinstance(overlay, dict) or set(overlay) != {'version', 'source_sha256', 'corrections'}
@@ -642,7 +713,8 @@ class RequestPool:
             raise
 
     def transcribe(self, audio, output, duration, configuration):
-        if output.exists() or output.with_suffix('.timing-overrides.json').exists():
+        if (output.exists() or output.with_suffix('.timing-overrides.json').exists()
+                or output.with_suffix('.word-exclusions.json').exists()):
             return self.checked_checkpoint(output, duration)
         marker = output.with_suffix('.inflight.json')
         if marker.exists():
@@ -1118,7 +1190,8 @@ def process_episode(video, args, pool):
                 for chunk in chunks:
                     index = chunk['index']
                     checkpoint = cache / f'chunk-{index:03}.json'
-                    if checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists():
+                    if (checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists()
+                            or checkpoint.with_suffix('.word-exclusions.json').exists()):
                         data = read_checkpoint(checkpoint, chunk['end'] - chunk['start'])
                         results[index] = data
                     elif args.format_only:
@@ -1145,6 +1218,9 @@ def process_episode(video, args, pool):
                     data, adjustments = read_checkpoint(cache / f'chunk-{index:03}.json',
                                                         chunk['end'] - chunk['start'], include_corrections=True)
                     for adjustment in adjustments:
+                        if adjustment['kind'] == 'reviewed_word_exclusion':
+                            adjustment.update(section=index, global_start=chunk['start'] + offset(adjustment['raw_word']['startOffset']))
+                            continue
                         adjustment.update(section=index, word_id=len(words) + adjustment['local_word_index'],
                                           global_start=chunk['start'] + adjustment['start_seconds'],
                                           global_end=chunk['start'] + adjustment['end_seconds'])
@@ -1154,7 +1230,8 @@ def process_episode(video, args, pool):
                                     speaker=f"{index}:{word['speaker']}", section=index, id=len(words))
                         words.append(word)
                 corrections, flags = repair_long_words(words, preparation['silences'],
-                                                       reviewed_word_ids={item['word_id'] for item in overlay_corrections})
+                                                       reviewed_word_ids={item['word_id'] for item in overlay_corrections
+                                                                          if item['kind'] == 'reviewed_timing_override'})
                 words.sort(key=lambda word: (word['start'], word['id']))
                 atomic_json(cache / 'words.json', words)
                 result.update(word_count=len(words), corrections=overlay_corrections + corrections,

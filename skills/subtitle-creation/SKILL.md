@@ -156,6 +156,13 @@ cache and model settings with `--format-only` after review, without paying to
 repeat successful transcription. A fresh successful response with invalid
 timing stops queued sections and remains cached without an uncertain marker.
 
+For a terminal malformed `uid:<digits>` speaker token with a missing end offset,
+only an explicit private `chunk-NNN.word-exclusions.json` supported by a retained
+successful bounded end-of-section audio recheck may remove that entry from the
+in-memory word list. It cannot exclude spoken words or coexist with a timing
+overlay. Follow the [strict exclusion schema](../../docs/validation.md#explicit-reviewed-terminal-artifact-exclusion).
+Never generate exclusions automatically; stop if audio evidence is uncertain.
+
 ## Reviewed priority waves
 
 For ordered multi-series work, use the bundled `scripts/batch.py` with an

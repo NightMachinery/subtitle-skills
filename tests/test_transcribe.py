@@ -167,6 +167,183 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls, [1])
         self.assertTrue(path.exists())
 
+    def exclusion_overlay(self, path):
+        raw = response()
+        words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+        words.append({'word': 'uid:123', 'startOffset': '9s', 'speakerLabel': 'artifact'})
+        t.atomic_json(path, raw)
+        recheck = path.parent / 'synthetic-recheck.json'
+        t.atomic_json(recheck, response())
+        overlay = {'version': 1, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                   'exclusions': [{'part_index': 0, 'word_index': 4, 'raw_word': copy.deepcopy(words[-1]),
+                       'reviewer': 'synthetic reviewer', 'reason': 'bounded terminal audio check',
+                       'evidence': {'recheck_path': str(recheck.resolve()),
+                           'recheck_sha256': hashlib.sha256(recheck.read_bytes()).hexdigest(),
+                           'clip_start_seconds': 0, 'clip_end_seconds': 10}}]}
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        return overlay, recheck
+
+    def test_verified_exclusion_native_formatting_preserves_raw_and_provenance(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay, recheck = self.exclusion_overlay(path)
+        before, evidence_before = path.read_bytes(), recheck.read_bytes()
+        original = json.loads(before)
+        pool = self.pool(lambda *_: self.fail('network called'))
+        with patch.object(pool, 'token', side_effect=AssertionError('authentication called')):
+            copied = pool.transcribe(b'offline', path, 10, t.settings(args))
+            expected = copy.deepcopy(original)
+            expected['candidates'][0]['content']['parts'][0]['audioTranscription']['words'].pop()
+            self.assertEqual(copied, expected)
+            args.format_only = True
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(recheck.read_bytes(), evidence_before)
+        audit = result['corrections'][0]
+        self.assertEqual(audit['kind'], 'reviewed_word_exclusion')
+        self.assertEqual(audit['raw_word'], overlay['exclusions'][0]['raw_word'])
+        self.assertEqual(audit['evidence'], overlay['exclusions'][0]['evidence'])
+        self.assertEqual(audit['global_start'], 9)
+        self.assertEqual(audit['section'], 0)
+        self.assertNotIn('word_id', audit)
+        self.assertEqual(result['review_flags'][0], audit)
+        self.assertEqual(copied['usageMetadata'], original['usageMetadata'])
+        cues = t.read_json(cache / 'cues.json')
+        self.assertTrue(all(cue['end'] > cue['start'] for cue in cues))
+        self.assertIn('A small offline test.', video.with_suffix('.en.srt').read_text())
+        self.assertEqual(t.FORMAT_VERSION, 1)
+
+    def test_word_exclusion_rejects_schema_identity_and_nonterminal_targets(self):
+        path = self.directory / 'chunk-000.json'
+        valid, recheck = self.exclusion_overlay(path)
+        mutations = [lambda x: x.update(version=True), lambda x: x.update(source_sha256='bad'),
+                     lambda x: x.update(extra=1), lambda x: x['exclusions'].append(copy.deepcopy(x['exclusions'][0])),
+                     lambda x: x['exclusions'][0].update(part_index=True),
+                     lambda x: x['exclusions'][0].update(word_index=-1),
+                     lambda x: x['exclusions'][0].update(word_index=0),
+                     lambda x: x['exclusions'][0].update(word_index=99),
+                     lambda x: x['exclusions'][0].update(reviewer=' '),
+                     lambda x: x['exclusions'][0]['raw_word'].update(endOffset=None),
+                     lambda x: x['exclusions'][0]['evidence'].update(clip_end_seconds=9),
+                     lambda x: x['exclusions'][0]['evidence'].update(clip_start_seconds=1),
+                     lambda x: x['exclusions'][0]['evidence'].update(recheck_sha256='bad'),
+                     lambda x: x['exclusions'][0]['evidence'].update(extra=1)]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                overlay = copy.deepcopy(valid)
+                mutate(overlay)
+                t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        for target_change in ({'word': 'spoken'}, {'word': 'uid:123.'}, {'endOffset': '9.1s'}):
+            valid, recheck = self.exclusion_overlay(path)
+            raw = t.read_json(path)
+            raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][-1].update(target_change)
+            t.atomic_json(path, raw)
+            valid['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+            valid['exclusions'][0]['raw_word'] = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][-1]
+            t.atomic_json(path.with_suffix('.word-exclusions.json'), valid)
+            with self.assertRaises(t.SubtitleError):
+                t.read_checkpoint(path, 10)
+
+    def test_orphan_exclusion_stops_before_audio_submission(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        self.exclusion_overlay(path)
+        path.unlink()
+        pool = self.pool(lambda *_: self.fail('orphan overlay allowed paid request'))
+        with self.assertRaises(t.SubtitleError):
+            pool.transcribe(b'offline', path, 10, t.settings(args))
+        result = t.process_episode(video, args, self.pool(lambda *_: self.fail('orphan episode overlay allowed request')))
+        self.assertEqual(result['status'], 'failed')
+        self.assertFalse(path.with_suffix('.inflight.json').exists())
+        self.assertFalse(path.with_suffix('.requests.json').exists())
+
+    def test_exclusion_across_parts_and_nonterminal_boundary(self):
+        path = self.directory / 'chunk-000.json'
+        overlay, recheck = self.exclusion_overlay(path)
+        raw = t.read_json(path)
+        parts = raw['candidates'][0]['content']['parts']
+        tail = parts[0]['audioTranscription']['words'].pop()
+        parts.append({'text': 'retained text', 'audioTranscription': {'words': [tail]}})
+        parts.append({'text': 'retained metadata'})
+        t.atomic_json(path, raw)
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        overlay['exclusions'][0].update(part_index=1, word_index=0)
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        copied = t.read_checkpoint(path, 10)
+        self.assertEqual(copied['candidates'][0]['content']['parts'][1]['text'], 'retained text')
+        self.assertEqual(copied['candidates'][0]['content']['parts'][1]['audioTranscription']['words'], [])
+        parts[2]['audioTranscription'] = {'words': [{'word': 'later', 'startOffset': '9.1s', 'endOffset': '9.2s'}]}
+        t.atomic_json(path, raw)
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 10)
+        overlay, recheck = self.exclusion_overlay(path)
+        overlay['exclusions'][0]['evidence']['clip_end_seconds'] = 100
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 100)
+
+    def test_reviewed_exclusion_allows_only_missing_paid_sections_after_validation(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay, recheck = self.exclusion_overlay(path)
+        raw = t.read_json(path)
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][-1]['startOffset'] = '4.5s'
+        t.atomic_json(path, raw)
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        overlay['exclusions'][0]['raw_word']['startOffset'] = '4.5s'
+        overlay['exclusions'][0]['evidence']['clip_end_seconds'] = 5
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        t.atomic_json(cache / 'preparation.json', {'duration': 10, 'silences': [],
+            'chunks': [{'index': 0, 'start': 0, 'end': 5}, {'index': 1, 'start': 5, 'end': 10}]})
+        calls = []
+        pool = self.pool(lambda *_: calls.append(1) or response())
+        result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(calls, [1])
+        video.with_suffix('.en.srt').unlink()
+        (cache / 'chunk-001.json').unlink()
+        overlay = t.read_json(path.with_suffix('.word-exclusions.json'))
+        overlay['source_sha256'] = 'invalid'
+        t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+        result = t.process_episode(video, args, self.pool(lambda *_: self.fail('invalid cached evidence allowed paid request')))
+        self.assertEqual(result['status'], 'failed')
+
+    def test_word_exclusion_requires_successful_exact_bounded_final_audio_anchors(self):
+        path = self.directory / 'chunk-000.json'
+        for mode in ('unfinished', 'overflow', 'uid', 'uid_text', 'different', 'short', 'missing'):
+            with self.subTest(mode=mode):
+                overlay, recheck = self.exclusion_overlay(path)
+                raw = t.read_json(recheck)
+                words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+                if mode == 'unfinished':
+                    raw['candidates'][0]['finishReason'] = 'MAX_TOKENS'
+                elif mode == 'overflow':
+                    words[-1]['endOffset'] = '10.1s'
+                elif mode == 'uid':
+                    words[0]['word'] = 'uid:123'
+                elif mode == 'uid_text':
+                    raw['candidates'][0]['content']['parts'][0]['audioTranscription']['text'] = 'A small offline test. uid:123'
+                elif mode == 'different':
+                    words[-1]['word'] = 'guess'
+                elif mode == 'short':
+                    del words[:2]
+                else:
+                    del words[-1]['endOffset']
+                t.atomic_json(recheck, raw)
+                overlay['exclusions'][0]['evidence']['recheck_sha256'] = hashlib.sha256(recheck.read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.word-exclusions.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        overlay, recheck = self.exclusion_overlay(path)
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), {})
+        with self.assertRaises(t.SubtitleError):
+            t.read_checkpoint(path, 10)
+
     def timing_overlay(self, path, *, raw=None):
         raw = response() if raw is None else raw
         target = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]
