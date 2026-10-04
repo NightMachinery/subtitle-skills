@@ -305,6 +305,44 @@ def same_timing_word(original, anchor):
     return bool(original) and original == anchor
 
 
+def telephone_timing_span(original, recheck, evidence):
+    """Match an explicitly indexed span only to an ASCII telephone token."""
+    first, last = evidence['recheck_word_index'], evidence['recheck_end_word_index']
+    if (type(first) is not int or type(last) is not int or first < 0
+            or last <= first or last - first >= 6):
+        raise SubtitleError('Telephone timing span requires two to six ordered integer indices')
+    source = original.rstrip('.,;:!?') if isinstance(original, str) else ''
+    if not re.fullmatch(r'(?:\+?[0-9]{1,3}-)?[0-9]{3}-[0-9]{3}-(?:[0-9]{4}|[A-Za-z]{4})', source):
+        raise SubtitleError('Timing spans require an explicit hyphenated ASCII telephone token')
+    anchors = [checkpoint_word(recheck, evidence['recheck_part_index'], index)
+               for index in range(first, last + 1)]
+    transcript = recheck['candidates'][0]['content']['parts'][evidence['recheck_part_index']]['audioTranscription']
+    speakers = [str(anchor.get('speakerLabel', transcript.get('speakerLabel', 'narrator')))
+                for anchor in anchors]
+    if len(set(speakers)) != 1:
+        raise SubtitleError('Telephone timing span must use the same speaker')
+    tokens = []
+    previous_end = None
+    for index, anchor in enumerate(anchors):
+        token = anchor.get('word')
+        if not isinstance(token, str):
+            raise SubtitleError('Telephone timing span has invalid token text')
+        if index == len(anchors) - 1:
+            token = token.rstrip('.,;:!?')
+        if not re.fullmatch(r'\+?[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-?', token) or ('+' in token and index != 0):
+            raise SubtitleError('Telephone timing span has internal punctuation or invalid characters')
+        start, end = offset(anchor['startOffset']), offset(anchor['endOffset'])
+        if start >= end or (previous_end is not None and start < previous_end):
+            raise SubtitleError('Telephone timing span intervals overlap, reverse or have zero duration')
+        previous_end = end
+        tokens.append(token)
+    # All compared characters have already been restricted to ASCII. Only the
+    # telephone mnemonic suffix can contain letters; preserve any leading plus.
+    if source.replace('-', '').lower() != ''.join(tokens).replace('-', '').lower():
+        raise SubtitleError('Telephone timing span does not preserve the source telephone token')
+    return anchors
+
+
 def timing_number(value):
     try:
         valid = type(value) in (int, float) and math.isfinite(value)
@@ -519,7 +557,8 @@ def _read_checkpoint(path, duration, include_corrections):
             if not 0 <= start <= end <= duration:
                 raise SubtitleError('Timing override endpoints are outside the section or reversed')
             evidence = correction['evidence']
-            if not isinstance(evidence, dict) or set(evidence) != evidence_keys:
+            if (not isinstance(evidence, dict) or set(evidence) not in
+                    (evidence_keys, evidence_keys | {'recheck_end_word_index'})):
                 raise SubtitleError('Timing override bounded audio recheck evidence is incomplete')
             clip_start, clip_end = (timing_number(evidence[field])
                                    for field in ('clip_start_seconds', 'clip_end_seconds'))
@@ -543,12 +582,17 @@ def _read_checkpoint(path, duration, include_corrections):
                     for anchor in part.get('audioTranscription', {}).get('words', []):
                         if not 0 <= offset(anchor['startOffset']) <= offset(anchor['endOffset']) <= clip_duration:
                             raise SubtitleError('Timing override recheck word is outside the exact clip')
-                anchor = checkpoint_word(recheck, evidence['recheck_part_index'], evidence['recheck_word_index'])
+                if 'recheck_end_word_index' in evidence:
+                    anchors = telephone_timing_span(correction['word'], recheck, evidence)
+                else:
+                    anchors = [checkpoint_word(recheck, evidence['recheck_part_index'], evidence['recheck_word_index'])]
+                anchor = anchors[0]
             except (OSError, ValueError, UnicodeError, KeyError, TypeError, AttributeError):
                 raise SubtitleError('Timing override raw recheck evidence is malformed or unavailable') from None
-            if (not same_timing_word(correction['word'], anchor.get('word'))
+            if (('recheck_end_word_index' not in evidence
+                     and not same_timing_word(correction['word'], anchor.get('word')))
                     or not math.isclose(start, clip_start + offset(anchor.get('startOffset')), rel_tol=0, abs_tol=1e-6)
-                    or not math.isclose(end, clip_start + offset(anchor.get('endOffset')), rel_tol=0, abs_tol=1e-6)):
+                    or not math.isclose(end, clip_start + offset(anchors[-1].get('endOffset')), rel_tol=0, abs_tol=1e-6)):
                 raise SubtitleError('Timing override endpoints or word lack matching raw recheck support')
             # The raw file and every other copied field stay untouched.
             word['startOffset'], word['endOffset'] = start, end
@@ -558,6 +602,12 @@ def _read_checkpoint(path, duration, include_corrections):
             adjustments.append({'kind': 'reviewed_timing_override', **copy.deepcopy(correction),
                                 'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve()),
                                 'source_sha256': overlay['source_sha256'], 'local_word_index': local_index})
+            if 'recheck_end_word_index' in evidence:
+                adjustments[-1]['recheck_anchor_span'] = [
+                    {'part_index': evidence['recheck_part_index'], 'word_index': index,
+                     'word': copy.deepcopy(item)}
+                    for index, item in zip(range(evidence['recheck_word_index'],
+                                                evidence['recheck_end_word_index'] + 1), anchors)]
     try:
         timed_words(data, duration)
     except (TypeError, KeyError, AttributeError, ValueError):

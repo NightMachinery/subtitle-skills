@@ -74,6 +74,25 @@ must equal clip start plus its actual raw offsets, with only one microsecond of
 floating-point tolerance. Manual claims without this retained word anchor are
 not accepted.
 
+Evidence may additionally contain `recheck_end_word_index` for an explicitly
+reviewed hyphenated ASCII telephone token, for example `1-555-234-ABCD.` or
+`555-234-6789`. This selects an inclusive span of two to six consecutive words
+in the indexed part, with nonnegative integer indices (never booleans), a single
+speaker, positive ordered intervals, and no overlap. Gaps are allowed. The source
+must match `(?:\+?[0-9]{1,3}-)?[0-9]{3}-[0-9]{3}-(?:[0-9]{4}|[A-Za-z]{4})`
+after stripping trailing sentence punctuation. Span tokens allow only ASCII
+alphanumeric groups separated by single hyphens, an optional trailing delimiter
+hyphen, and an optional leading `+` on the first token; leading, repeated and
+standalone hyphens are rejected;
+sentence punctuation is allowed only at the end of the final token. Removing
+hyphens must preserve every character in order, including `+`, with ASCII case
+insensitivity only for the mnemonic suffix. Proposed endpoints use the first
+word's start and final word's end plus the clip offset, with the existing
+one-microsecond tolerance. The full indexed anchor span is retained in private
+applied provenance. This is an explicit overlay, never an automatic text or
+timing correction. Omitting the optional end index keeps the strict single-word
+schema and matching behavior, including its case preservation.
+
 A recheck may represent a brief word as a zero-duration point. Preserve that
 exact point rather than inventing an endpoint. The original interval warning
 remains in review flags, and final subtitle cues must still have positive,

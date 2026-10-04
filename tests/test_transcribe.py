@@ -553,6 +553,125 @@ class RunnerTests(unittest.TestCase):
         t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
         return overlay
 
+    def phone_span_overlay(self, path, source='+1-555-234-ABCD.', tokens=None):
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = source
+        overlay = self.timing_overlay(path, raw=raw)
+        recheck = response()
+        tokens = ['+1-', '555-', '234-', 'abcd.'] if tokens is None else tokens
+        words = [{'word': token, 'startOffset': 0.2 + index * 0.5,
+                  'endOffset': 0.6 + index * 0.5} for index, token in enumerate(tokens)]
+        recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'] = words
+        evidence = overlay['corrections'][0]['evidence']
+        evidence['recheck_end_word_index'] = len(words) - 1
+        evidence['clip_start_seconds'] = 0.5
+        evidence['clip_end_seconds'] = 4.5
+        t.atomic_json(Path(evidence['recheck_path']), recheck)
+        evidence['recheck_sha256'] = hashlib.sha256(Path(evidence['recheck_path']).read_bytes()).hexdigest()
+        overlay['corrections'][0].update(start_seconds=0.7, end_seconds=0.5 + words[-1]['endOffset'])
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        return overlay, recheck
+
+    def test_reviewed_phone_span_preserves_raw_text_and_indexed_provenance(self):
+        path = self.directory / 'chunk-000.json'
+        for source, tokens in [('+1-555-234-ABCD.', ['+1-', '555-', '234-', 'abcd.']),
+                               ('555-234-6789', ['555', '234', '6789']),
+                               ('1-555-234-ABCD.', ['1-', '55', '5-', '23', '4-', 'ABCD.']),
+                               ('1-555-234-ABCD.', ['1', '555', '234', 'AbCd!']),
+                               ('1-555-234-ABCD.', ['1555', '234', 'abcd.'])]:
+            with self.subTest(source=source):
+                overlay, recheck = self.phone_span_overlay(path, source, tokens)
+                before = path.read_bytes()
+                evidence_before = Path(overlay['corrections'][0]['evidence']['recheck_path']).read_bytes()
+                data, adjustments = t.read_checkpoint(path, 10, include_corrections=True)
+                words = data['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+                self.assertEqual(words[0]['word'], source)
+                self.assertAlmostEqual(words[0]['startOffset'], 0.7)
+                self.assertAlmostEqual(words[0]['endOffset'], overlay['corrections'][0]['end_seconds'])
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(Path(overlay['corrections'][0]['evidence']['recheck_path']).read_bytes(), evidence_before)
+                span = adjustments[0]['recheck_anchor_span']
+                self.assertEqual([item['word_index'] for item in span], list(range(len(tokens))))
+                self.assertEqual([item['word'] for item in span],
+                                 recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'])
+
+    def test_reviewed_phone_span_rejects_unsupported_evidence(self):
+        path = self.directory / 'chunk-000.json'
+        cases = [
+            ('changed digit', lambda c, w: w[1].update(word='556-')),
+            ('missing plus', lambda c, w: w[0].update(word='1-')),
+            ('changed sign', lambda c, w: w[0].update(word='-1-')),
+            ('missing digit', lambda c, w: w[1].update(word='55-')),
+            ('reordered digits', lambda c, w: w[2].update(word='243-')),
+            ('internal punctuation', lambda c, w: w[1].update(word='555,')),
+            ('unicode digits', lambda c, w: w[1].update(word='５５５-')),
+            ('zero width', lambda c, w: w[1].update(word='555\u200b-')),
+            ('wrong endpoint', lambda c, w: c.update(end_seconds=2.5)),
+            ('wrong start', lambda c, w: c.update(start_seconds=0.8)),
+            ('boolean end', lambda c, w: c['evidence'].update(recheck_end_word_index=True)),
+            ('boolean start', lambda c, w: c['evidence'].update(recheck_word_index=False)),
+            ('boolean part', lambda c, w: c['evidence'].update(recheck_part_index=False)),
+            ('single index span', lambda c, w: c['evidence'].update(recheck_end_word_index=0)),
+            ('negative end', lambda c, w: c['evidence'].update(recheck_end_word_index=-1)),
+            ('negative start', lambda c, w: c['evidence'].update(recheck_word_index=-1)),
+            ('out of bounds', lambda c, w: c['evidence'].update(recheck_end_word_index=4)),
+            ('float end', lambda c, w: c['evidence'].update(recheck_end_word_index=3.0)),
+            ('oversized', lambda c, w: c['evidence'].update(recheck_end_word_index=6)),
+            ('reversed indices', lambda c, w: c['evidence'].update(recheck_word_index=2, recheck_end_word_index=1)),
+            ('speaker mismatch', lambda c, w: w[2].update(speakerLabel='other')),
+            ('overlap', lambda c, w: w[1].update(startOffset=0.5)),
+            ('point', lambda c, w: w[1].update(endOffset=w[1]['startOffset'])),
+            ('reversed interval', lambda c, w: w[1].update(endOffset=0.3)),
+            ('plus in middle', lambda c, w: w[1].update(word='+555-')),
+        ]
+        for name, change in cases:
+            with self.subTest(case=name):
+                overlay, recheck = self.phone_span_overlay(path)
+                correction = overlay['corrections'][0]
+                words = recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+                change(correction, words)
+                evidence = correction['evidence']
+                t.atomic_json(Path(evidence['recheck_path']), recheck)
+                evidence['recheck_sha256'] = hashlib.sha256(Path(evidence['recheck_path']).read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        for tokens in [['-1-', '555-', '234-', 'ABCD.'],
+                       ['1--', '555-', '234-', 'ABCD.'],
+                       ['1', '-', '555', '234', 'ABCD.']]:
+            with self.subTest(tokens=tokens):
+                self.phone_span_overlay(path, '1-555-234-ABCD.', tokens)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+        for source, tokens in [('some-word', ['some', 'word']),
+                               ('CALL-555-234-ABCD', ['CALL', '555', '234', 'ABCD']),
+                               ('555-234-ABCDEF', ['555', '234', 'ABCDEF']),
+                               ('555-234-6789%', ['555', '234', '6789%'])]:
+            with self.subTest(source=source):
+                self.phone_span_overlay(path, source, tokens)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_single_phone_anchor_keeps_strict_case_preserving_matching(self):
+        path = self.directory / 'chunk-000.json'
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = '1-555-234-ABCD.'
+        overlay = self.timing_overlay(path, raw=raw)
+        evidence = overlay['corrections'][0]['evidence']
+        recheck = t.read_json(evidence['recheck_path'])
+        anchor = recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]
+        for token, accepted in [('1-555-234-ABCD!', True), ('1-555-234-abcd.', False)]:
+            with self.subTest(token=token):
+                anchor['word'] = token
+                t.atomic_json(Path(evidence['recheck_path']), recheck)
+                evidence['recheck_sha256'] = hashlib.sha256(Path(evidence['recheck_path']).read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+                if accepted:
+                    t.read_checkpoint(path, 10)
+                else:
+                    with self.assertRaises(t.SubtitleError):
+                        t.read_checkpoint(path, 10)
+
     def test_verified_timing_overlay_keeps_raw_bytes_and_other_fields(self):
         path = self.directory / 'chunk-000.json'
         raw = response()

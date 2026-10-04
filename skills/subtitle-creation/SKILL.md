@@ -148,6 +148,9 @@ both endpoints may an agent explicitly author a private adjacent
 identity, reviewer/reason and bounded audio evidence are validated before the
 runner applies offsets to an in-memory copy. Read the strict schema in
 [validation guidance](../../docs/validation.md#explicit-reviewed-timing-overlays).
+For an explicit hyphenated ASCII telephone token split across recheck words,
+use the schema's optional indexed telephone span, preserving digits, any leading
+plus, and original text. Other multiword spans are rejected.
 A zero-duration word anchor can support the same exact point; retain its flag
 and require positive final cue durations. Never invent an endpoint, silently
 edit raw responses, or create an overlay to bypass unresolved evidence. Overlay
