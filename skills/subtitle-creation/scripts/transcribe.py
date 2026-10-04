@@ -305,6 +305,18 @@ def same_timing_word(original, anchor):
     return bool(original) and original == anchor
 
 
+def numeric_timing_word(original, anchor):
+    """Match only one ASCII digit and its exact lowercase English spelling."""
+    if not isinstance(original, str) or not isinstance(anchor, str):
+        return False
+    original, anchor = original.rstrip('.,;:!?'), anchor.rstrip('.,;:!?')
+    spellings = dict(zip('0123456789',
+                         ('zero', 'one', 'two', 'three', 'four', 'five',
+                          'six', 'seven', 'eight', 'nine')))
+    return ((original in spellings and spellings[original] == anchor)
+            or (anchor in spellings and spellings[anchor] == original))
+
+
 def telephone_timing_span(original, recheck, evidence):
     """Match an explicitly indexed span only to an ASCII telephone token."""
     first, last = evidence['recheck_word_index'], evidence['recheck_end_word_index']
@@ -558,8 +570,11 @@ def _read_checkpoint(path, duration, include_corrections):
                 raise SubtitleError('Timing override endpoints are outside the section or reversed')
             evidence = correction['evidence']
             if (not isinstance(evidence, dict) or set(evidence) not in
-                    (evidence_keys, evidence_keys | {'recheck_end_word_index'})):
+                    (evidence_keys, evidence_keys | {'recheck_end_word_index'},
+                     evidence_keys | {'numeric_word_anchor'})):
                 raise SubtitleError('Timing override bounded audio recheck evidence is incomplete')
+            if 'numeric_word_anchor' in evidence and evidence['numeric_word_anchor'] is not True:
+                raise SubtitleError('Numeric word anchor opt-in must be exactly true')
             clip_start, clip_end = (timing_number(evidence[field])
                                    for field in ('clip_start_seconds', 'clip_end_seconds'))
             if not 0 <= clip_start < clip_end <= duration or clip_end - clip_start > 60:
@@ -590,7 +605,9 @@ def _read_checkpoint(path, duration, include_corrections):
             except (OSError, ValueError, UnicodeError, KeyError, TypeError, AttributeError):
                 raise SubtitleError('Timing override raw recheck evidence is malformed or unavailable') from None
             if (('recheck_end_word_index' not in evidence
-                     and not same_timing_word(correction['word'], anchor.get('word')))
+                     and not (numeric_timing_word(correction['word'], anchor.get('word'))
+                              if 'numeric_word_anchor' in evidence
+                              else same_timing_word(correction['word'], anchor.get('word'))))
                     or not math.isclose(start, clip_start + offset(anchor.get('startOffset')), rel_tol=0, abs_tol=1e-6)
                     or not math.isclose(end, clip_start + offset(anchors[-1].get('endOffset')), rel_tol=0, abs_tol=1e-6)):
                 raise SubtitleError('Timing override endpoints or word lack matching raw recheck support')

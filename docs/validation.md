@@ -74,6 +74,35 @@ must equal clip start plus its actual raw offsets, with only one microsecond of
 floating-point tolerance. Manual claims without this retained word anchor are
 not accepted.
 
+For a single indexed word only, evidence may instead add
+`"numeric_word_anchor": true`. The value must be the JSON boolean `true`;
+`false`, strings, numbers and null are rejected. This explicit opt-in requires
+one ASCII digit `0` through `9` on one side and its exact lowercase English
+spelling (`zero` through `nine`) on the other, in either direction. For example,
+an original `"7,"` may use a raw indexed `"seven."` anchor with evidence:
+
+```json
+{
+  "recheck_path": "/synthetic/bounded-recheck.json",
+  "recheck_sha256": "<SHA256 of retained raw recheck bytes>",
+  "clip_start_seconds": 0,
+  "clip_end_seconds": 4,
+  "recheck_part_index": 0,
+  "recheck_word_index": 0,
+  "numeric_word_anchor": true
+}
+```
+
+Only the existing trailing sentence punctuation may differ. Homophones,
+uppercase spellings, other languages, numbers of two or more digits, leading
+zeros, signs, decimals, ordinals and mixed text are rejected. The opt-in cannot
+coexist with `recheck_end_word_index` and does not permit phrases or spans.
+It changes only interval offsets, preserves original text and both raw files,
+and remains in copied correction evidence. Both endpoints must still equal the
+indexed raw anchor offsets plus clip start; all checksums, bounds and identity
+checks above still apply. Without this field, single-word matching is unchanged.
+The helper never creates a recheck or repairs a word automatically.
+
 Evidence may additionally contain `recheck_end_word_index` for an explicitly
 reviewed hyphenated ASCII telephone token, for example `1-555-234-ABCD.` or
 `555-234-6789`. This selects an inclusive span of two to six consecutive words
@@ -90,7 +119,7 @@ insensitivity only for the mnemonic suffix. Proposed endpoints use the first
 word's start and final word's end plus the clip offset, with the existing
 one-microsecond tolerance. The full indexed anchor span is retained in private
 applied provenance. This is an explicit overlay, never an automatic text or
-timing correction. Omitting the optional end index keeps the strict single-word
+timing correction. Omitting both optional fields keeps the strict single-word
 schema and matching behavior, including its case preservation.
 
 A recheck may represent a brief word as a zero-duration point. Preserve that

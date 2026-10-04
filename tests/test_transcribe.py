@@ -553,6 +553,75 @@ class RunnerTests(unittest.TestCase):
         t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
         return overlay
 
+    def numeric_overlay(self, path, original='7,', anchor_word='seven.'):
+        raw = response()
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = original
+        overlay = self.timing_overlay(path, raw=raw)
+        evidence = overlay['corrections'][0]['evidence']
+        recheck_path = Path(evidence['recheck_path'])
+        recheck = t.read_json(recheck_path)
+        recheck['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = anchor_word
+        t.atomic_json(recheck_path, recheck)
+        evidence.update(numeric_word_anchor=True,
+                        recheck_sha256=hashlib.sha256(recheck_path.read_bytes()).hexdigest())
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        return overlay
+
+    def test_numeric_timing_anchor_preserves_entire_response_and_evidence(self):
+        path = self.directory / 'chunk-000.json'
+        for digit, spelling in zip('0123456789',
+                                  ('zero', 'one', 'two', 'three', 'four', 'five',
+                                   'six', 'seven', 'eight', 'nine')):
+            for original, anchor in ((digit + ',', spelling + '.'), (spelling, digit)):
+                with self.subTest(original=original, anchor=anchor):
+                    overlay = self.numeric_overlay(path, original, anchor)
+                    recheck_path = Path(overlay['corrections'][0]['evidence']['recheck_path'])
+                    before, recheck_before = path.read_bytes(), recheck_path.read_bytes()
+                    expected = t.read_json(path)
+                    expected['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0].update(
+                        startOffset=0.2, endOffset=0.6)
+                    data, audit = t.read_checkpoint(path, 10, include_corrections=True)
+                    self.assertEqual(data, expected)
+                    self.assertEqual(path.read_bytes(), before)
+                    self.assertEqual(recheck_path.read_bytes(), recheck_before)
+                    self.assertEqual(audit[0]['evidence'], overlay['corrections'][0]['evidence'])
+
+    def test_numeric_timing_anchor_rejects_other_text(self):
+        path = self.directory / 'chunk-000.json'
+        for original, anchor in [('7', 'eight'), ('7', 'Seven'), ('2', 'to'),
+                                 ('4', 'quatre'), ('10', 'ten'), ('07', 'seven'),
+                                 ('7.0', 'seven'), ('-7', 'seven'), ('+7', 'seven'),
+                                 ('7th', 'seven'), ('7 apples', 'seven'),
+                                 ('7', 'seven apples'), ('７', 'seven'),
+                                 ('7', '7'), ('seven', 'seven')]:
+            with self.subTest(original=original, anchor=anchor):
+                self.numeric_overlay(path, original, anchor)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_numeric_timing_anchor_requires_opt_in_and_all_existing_guards(self):
+        path = self.directory / 'chunk-000.json'
+        mutations = [
+            ('no opt-in', lambda c: c['evidence'].pop('numeric_word_anchor')),
+            *[(repr(value), lambda c, v=value: c['evidence'].update(numeric_word_anchor=v))
+              for value in (False, None, 1, 0, 'true', [], {})],
+            ('span conflict', lambda c: c['evidence'].update(recheck_end_word_index=1)),
+            ('checksum', lambda c: c['evidence'].update(recheck_sha256='invalid')),
+            ('start', lambda c: c.update(start_seconds=0.3)),
+            ('end', lambda c: c.update(end_seconds=0.7)),
+            ('original text', lambda c: c.update(word='seven')),
+            ('old offset', lambda c: c.update(old_start_offset=0)),
+            ('boolean index', lambda c: c['evidence'].update(recheck_word_index=True)),
+            ('bounds', lambda c: c['evidence'].update(clip_end_seconds=0.5)),
+        ]
+        for label, mutate in mutations:
+            with self.subTest(case=label):
+                overlay = self.numeric_overlay(path)
+                mutate(overlay['corrections'][0])
+                t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
     def phone_span_overlay(self, path, source='+1-555-234-ABCD.', tokens=None):
         raw = response()
         raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['word'] = source
