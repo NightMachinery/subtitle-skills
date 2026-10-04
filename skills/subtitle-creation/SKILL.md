@@ -163,6 +163,13 @@ in-memory word list. It cannot exclude spoken words or coexist with a timing
 overlay. Follow the [strict exclusion schema](../../docs/validation.md#explicit-reviewed-terminal-artifact-exclusion).
 Never generate exclusions automatically; stop if audio evidence is uncertain.
 
+For adjacent decimal and `%` entries whose touching percent interval is reversed,
+an explicit private `chunk-NNN.word-joins.json` may join their exact characters
+only when an indexed bounded raw audio recheck supports both merged endpoints.
+No guessed percent duration, lexical edit or automatic joining is allowed.
+Read the [strict numeric join schema](../../docs/validation.md#explicit-reviewed-numeric-joins).
+Retain both raw responses, obtain independent review, and stop uncertain requests.
+
 ## Reviewed priority waves
 
 For ordered multi-series work, use the bundled `scripts/batch.py` with an

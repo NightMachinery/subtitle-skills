@@ -167,6 +167,193 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(calls, [1])
         self.assertTrue(path.exists())
 
+    def join_overlay(self, path):
+        raw = response()
+        words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+        words[1:2] = [{'word': '12.5', 'startOffset': '0.8s', 'endOffset': '1s', 'extra': 'retained'},
+                      {'word': '%', 'startOffset': '1s', 'endOffset': '0.9s'}]
+        t.atomic_json(path, raw)
+        recheck = path.parent / 'synthetic-join-recheck.json'
+        checked = response()
+        checked['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][1].update(
+            word='12.5%', startOffset='0.8s', endOffset='1.2s')
+        t.atomic_json(recheck, checked)
+        overlay = {'version': 1, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                   'joins': [{'part_index': 0, 'word_index': 1, 'raw_words': copy.deepcopy(words[1:3]),
+                       'start_seconds': 0.8, 'end_seconds': 1.2,
+                       'reviewer': 'synthetic reviewer', 'reason': 'bounded audio numeric join',
+                       'evidence': {'recheck_path': str(recheck.resolve()),
+                           'recheck_sha256': hashlib.sha256(recheck.read_bytes()).hexdigest(),
+                           'clip_start_seconds': 0, 'clip_end_seconds': 4,
+                           'recheck_part_index': 0, 'recheck_word_index': 1}}]}
+        t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+        return overlay, recheck
+
+    def test_verified_numeric_join_native_offline_preserves_raw_and_provenance(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay, recheck = self.join_overlay(path)
+        before, evidence_before = path.read_bytes(), recheck.read_bytes()
+        pool = self.pool(lambda *_: self.fail('network called'))
+        with patch.object(pool, 'token', side_effect=AssertionError('authentication called')):
+            copied = pool.transcribe(b'offline', path, 10, t.settings(args))
+            expected = json.loads(before)
+            words = expected['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+            words[1].update(word='12.5%', startOffset=0.8, endOffset=1.2)
+            del words[2]
+            self.assertEqual(copied, expected)
+            args.format_only = True
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(recheck.read_bytes(), evidence_before)
+        audit = result['corrections'][0]
+        self.assertEqual(audit['kind'], 'reviewed_word_join')
+        self.assertEqual(audit['raw_words'], overlay['joins'][0]['raw_words'])
+        self.assertEqual(audit['evidence'], overlay['joins'][0]['evidence'])
+        self.assertEqual((audit['word_id'], audit['section'], audit['global_start'], audit['global_end']), (1, 0, 0.8, 1.2))
+        self.assertEqual(result['review_flags'][0], audit)
+        self.assertIn('A 12.5% offline test.', video.with_suffix('.en.srt').read_text())
+        self.assertTrue(all(cue['end'] > cue['start'] for cue in t.read_json(cache / 'cues.json')))
+        self.assertEqual(t.FORMAT_VERSION, 1)
+
+    def test_numeric_join_comma_decimal_maps_clip_and_protects_reviewed_onset(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay, recheck = self.join_overlay(path)
+        raw = t.read_json(path)
+        words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+        words[1].update(word='12,5', startOffset='0.8s', endOffset='4s')
+        words[2].update(startOffset='4s', endOffset='0.9s')
+        words[3].update(startOffset='4.5s', endOffset='4.8s')
+        words[4].update(startOffset='5s', endOffset='5.3s')
+        t.atomic_json(path, raw)
+        checked = response()
+        checked['candidates'][0]['content']['parts'][0]['audioTranscription']['words'] = [
+            {'word': '12,5%.', 'startOffset': '0.3s', 'endOffset': '3.7s'}]
+        t.atomic_json(recheck, checked)
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        entry = overlay['joins'][0]
+        entry.update(raw_words=copy.deepcopy(words[1:3]), start_seconds=0.8, end_seconds=4.2)
+        entry['evidence'].update(clip_start_seconds=0.5, clip_end_seconds=4.5, recheck_word_index=0,
+            recheck_sha256=hashlib.sha256(recheck.read_bytes()).hexdigest())
+        t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+        t.atomic_json(cache / 'preparation.json', {'duration': 10,
+            'silences': [{'start': 0.9, 'end': 3.8}], 'chunks': [{'index': 0, 'start': 0, 'end': 10}]})
+        args.format_only = True
+        result = t.process_episode(video, args, self.pool(lambda *_: self.fail('network called')))
+        self.assertEqual(result['status'], 'completed')
+        merged = t.read_json(cache / 'words.json')[1]
+        self.assertEqual((merged['word'], merged['start'], merged['end']), ('12,5%', 0.8, 4.2))
+        self.assertEqual(result['corrections'][0]['global_start'], 0.8)
+        self.assertEqual(len(result['corrections']), 1)
+
+    def test_numeric_join_rejects_schema_identity_indices_and_unsupported_evidence(self):
+        path = self.directory / 'chunk-000.json'
+        valid, recheck = self.join_overlay(path)
+        mutations = [lambda x: x.update(version=True), lambda x: x.update(source_sha256='bad'),
+            lambda x: x.update(extra=1), lambda x: x['joins'].append(copy.deepcopy(x['joins'][0])),
+            lambda x: x['joins'][0].update(part_index=True), lambda x: x['joins'][0].update(word_index=-1),
+            lambda x: x['joins'][0].update(word_index=99), lambda x: x['joins'][0].update(word_index=0),
+            lambda x: x['joins'][0].update(reviewer=' '), lambda x: x['joins'][0].update(end_seconds=0.8),
+            lambda x: x['joins'][0].update(start_seconds=0.9), lambda x: x['joins'][0].update(end_seconds=1.3),
+            lambda x: x['joins'][0].update(start_seconds=True),
+            lambda x: x['joins'][0]['raw_words'][0].update(startOffset=0.8),
+            lambda x: x['joins'][0]['evidence'].update(recheck_sha256='bad'),
+            lambda x: x['joins'][0]['evidence'].update(recheck_path='relative.json'),
+            lambda x: x['joins'][0]['evidence'].update(recheck_word_index=True),
+            lambda x: x['joins'][0]['evidence'].update(clip_start_seconds=0.9),
+            lambda x: x['joins'][0]['evidence'].update(clip_end_seconds=11),
+            lambda x: x['joins'][0]['evidence'].update(extra=1)]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                overlay = copy.deepcopy(valid)
+                mutate(overlay)
+                t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+                with self.assertRaises(t.SubtitleError):
+                    t.read_checkpoint(path, 10)
+
+    def test_numeric_join_narrow_character_timing_speaker_and_part_boundary(self):
+        path = self.directory / 'chunk-000.json'
+        for mode in ('negative', 'lexical', 'unit', 'unicode', 'valid_percent', 'gap', 'speaker', 'cross_part'):
+            with self.subTest(mode=mode):
+                overlay, recheck = self.join_overlay(path)
+                raw = t.read_json(path)
+                parts = raw['candidates'][0]['content']['parts']
+                words = parts[0]['audioTranscription']['words']
+                if mode == 'negative': words[1]['word'] = '-12.5'
+                elif mode == 'lexical': words[1]['word'] = 'twelve'
+                elif mode == 'unit': words[2]['word'] = 'kg'
+                elif mode == 'unicode': words[1]['word'] = '１２'
+                elif mode == 'valid_percent': words[2]['endOffset'] = '1.1s'
+                elif mode == 'gap': words[1]['endOffset'] = '0.99s'
+                elif mode == 'speaker': words[2]['speakerLabel'] = 'different'
+                else:
+                    parts.append({'audioTranscription': {'words': words[2:]}})
+                    del words[2:]
+                t.atomic_json(path, raw)
+                overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                if mode != 'cross_part': overlay['joins'][0]['raw_words'] = copy.deepcopy(words[1:3])
+                t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+                with self.assertRaises(t.SubtitleError): t.read_checkpoint(path, 10)
+
+    def test_numeric_join_recheck_bounds_checksum_completion_and_word_support(self):
+        path = self.directory / 'chunk-000.json'
+        for mode in ('unfinished', 'overflow', 'changed', 'missing', 'punctuation'):
+            with self.subTest(mode=mode):
+                overlay, recheck = self.join_overlay(path)
+                checked = t.read_json(recheck)
+                words = checked['candidates'][0]['content']['parts'][0]['audioTranscription']['words']
+                if mode == 'unfinished': checked['candidates'][0]['finishReason'] = 'MAX_TOKENS'
+                elif mode == 'overflow': words[-1]['endOffset'] = '4.1s'
+                elif mode == 'changed': words[1]['word'] = '13%'
+                elif mode == 'missing': del words[1]['endOffset']
+                else: words[1]['word'] = '12.5%.'
+                t.atomic_json(recheck, checked)
+                overlay['joins'][0]['evidence']['recheck_sha256'] = hashlib.sha256(recheck.read_bytes()).hexdigest()
+                t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+                if mode == 'punctuation':
+                    self.assertEqual(t.timed_words(t.read_checkpoint(path, 10), 10)[1]['word'], '12.5%')
+                else:
+                    with self.assertRaises(t.SubtitleError): t.read_checkpoint(path, 10)
+        overlay, recheck = self.join_overlay(path)
+        overlay['joins'][0]['evidence']['clip_end_seconds'] = 100
+        t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+        with self.assertRaises(t.SubtitleError): t.read_checkpoint(path, 100)
+
+    def test_numeric_join_orphans_and_overlay_coexistence_stop_before_network(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        for suffix in ('.timing-overrides.json', '.word-exclusions.json'):
+            self.join_overlay(path)
+            other = path.with_suffix(suffix)
+            t.atomic_json(other, {})
+            with self.assertRaises(t.SubtitleError): t.read_checkpoint(path, 10)
+            other.unlink()
+        path.unlink()
+        pool = self.pool(lambda *_: self.fail('orphan allowed network'))
+        with self.assertRaises(t.SubtitleError): pool.transcribe(b'offline', path, 10, t.settings(args))
+        self.assertEqual(t.process_episode(video, args, pool)['status'], 'failed')
+        self.assertFalse(path.with_suffix('.requests.json').exists())
+
+    def test_numeric_join_validates_cached_pair_before_only_missing_requests(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        self.join_overlay(path)
+        t.atomic_json(cache / 'preparation.json', {'duration': 10, 'silences': [],
+            'chunks': [{'index': 0, 'start': 0, 'end': 5}, {'index': 1, 'start': 5, 'end': 10}]})
+        calls = []
+        result = t.process_episode(video, args, self.pool(lambda *_: calls.append(1) or response()))
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(calls, [1])
+        video.with_suffix('.en.srt').unlink()
+        (cache / 'chunk-001.json').unlink()
+        overlay = t.read_json(path.with_suffix('.word-joins.json'))
+        overlay['source_sha256'] = 'invalid'
+        t.atomic_json(path.with_suffix('.word-joins.json'), overlay)
+        result = t.process_episode(video, args, self.pool(lambda *_: self.fail('invalid cached join allowed network')))
+        self.assertEqual(result['status'], 'failed')
+
     def exclusion_overlay(self, path):
         raw = response()
         words = raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words']

@@ -125,3 +125,38 @@ speakers, timestamps, usage and cache identity stay intact. Private corrections
 and flags retain exact target identity, evidence, paths, checksum, section and
 global start; a removed entry has no active word ID. Use `--format-only` for
 reviewed cached formatting, preserving approved outputs and avoiding paid replay.
+
+## Explicit reviewed numeric joins
+
+When a decimal and a separate `%` have touching raw boundaries but the percent
+interval is reversed, halt paid work and retain a bounded successful audio
+recheck. Never automatically join tokens. A private adjacent
+`chunk-NNN.word-joins.json` has exactly `version: 1`, `source_sha256` and `joins`
+containing exactly one entry with `part_index`, `word_index`, `raw_words`,
+`start_seconds`, `end_seconds`, `reviewer`, `reason` and `evidence`.
+
+Indices identify the first of two adjacent entries in one part and must be
+nonnegative integers, not booleans. `raw_words` preserves both complete raw
+dictionaries and types. The first word matches ASCII `[0-9]+(?:[.,][0-9]+)?`
+and has a valid interval. The second is exactly `%`, has a usable reversed
+interval, and starts at the first end within one microsecond. Resolved speaker
+labels must match. Negative numbers, other units, lexical edits, properly timed
+percent words, gaps, cross-part and cross-speaker pairs are rejected.
+
+Evidence has the same exact six fields as a timing overlay: absolute raw
+`recheck_path`, `recheck_sha256`, `clip_start_seconds`, `clip_end_seconds`,
+`recheck_part_index`, `recheck_word_index`. The successful STOP recheck fits the
+strict clip timeline, at most 60 seconds within the section and covering both
+original starts. Its indexed word matches the original decimal concatenated
+with `%`, allowing only different trailing sentence punctuation. Both proposed
+positive ordered endpoints equal clip start plus the actual anchor offsets
+within one microsecond. Retained audio evidence and independent review are
+required; stop uncertain requests rather than guess a percent-token duration.
+
+The runner only changes the copied first entry's word and two offsets, then
+removes the second entry. Other fields and both raw responses stay intact.
+Private `reviewed_word_join` corrections and flags retain both identities,
+evidence, paths, checksums and merged section/global timing. The merged word's
+active ID protects its verified onset from inferred repair. Other overlays on
+the same checkpoint and orphan join overlays stop processing before requests.
+Format-only reuse, full raw usage/accounting and cache identity remain unchanged.

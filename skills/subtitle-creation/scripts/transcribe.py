@@ -380,6 +380,77 @@ def reviewed_exclusion(data, path, raw_bytes, duration):
                     'source_sha256': overlay['source_sha256']}
 
 
+def reviewed_join(data, path, raw_bytes, duration):
+    """Join one audio-verified malformed decimal/percent pair in a private copy."""
+    overlay_path = path.with_suffix('.word-joins.json')
+    overlay = read_json(overlay_path)
+    if (not isinstance(overlay, dict) or set(overlay) != {'version', 'source_sha256', 'joins'}
+            or type(overlay['version']) is not int or overlay['version'] != 1
+            or overlay['source_sha256'] != hashlib.sha256(raw_bytes).hexdigest()
+            or not isinstance(overlay['joins'], list) or len(overlay['joins']) != 1):
+        raise SubtitleError('Word join schema or raw checksum is invalid')
+    entry = overlay['joins'][0]
+    keys = {'part_index', 'word_index', 'raw_words', 'start_seconds', 'end_seconds', 'reviewer', 'reason', 'evidence'}
+    if not isinstance(entry, dict) or set(entry) != keys:
+        raise SubtitleError('Word join entry schema is invalid')
+    left = checkpoint_word(data, entry['part_index'], entry['word_index'])
+    right = checkpoint_word(data, entry['part_index'], entry['word_index'] + 1)
+    if (not isinstance(entry['raw_words'], list) or len(entry['raw_words']) != 2
+            or json.dumps(entry['raw_words'], sort_keys=True) != json.dumps([left, right], sort_keys=True)
+            or not isinstance(left.get('word'), str) or re.fullmatch(r'[0-9]+(?:[.,][0-9]+)?', left['word']) is None
+            or right.get('word') != '%'):
+        raise SubtitleError('Word join requires exact adjacent decimal and percent identities')
+    left_start, left_end = offset(left.get('startOffset')), offset(left.get('endOffset'))
+    right_start, right_end = offset(right.get('startOffset')), offset(right.get('endOffset'))
+    transcript = data['candidates'][0]['content']['parts'][entry['part_index']]['audioTranscription']
+    if (not 0 <= left_start <= left_end <= duration or not 0 <= right_start <= duration
+            or not right_end < right_start
+            or not math.isclose(left_end, right_start, rel_tol=0, abs_tol=1e-6)
+            or str(left.get('speakerLabel', transcript.get('speakerLabel', 'narrator')))
+               != str(right.get('speakerLabel', transcript.get('speakerLabel', 'narrator')))):
+        raise SubtitleError('Word join requires a touching same-speaker pair with reversed percent timing')
+    if any(not isinstance(entry[field], str) or not entry[field].strip() for field in ('reviewer', 'reason')):
+        raise SubtitleError('Word join reviewer and reason are required')
+    start, end = (timing_number(entry[field]) for field in ('start_seconds', 'end_seconds'))
+    if not 0 <= start < end <= duration:
+        raise SubtitleError('Word join endpoints must be positive and within the section')
+    evidence = entry['evidence']
+    if not isinstance(evidence, dict) or set(evidence) != {'recheck_path', 'recheck_sha256', 'clip_start_seconds', 'clip_end_seconds', 'recheck_part_index', 'recheck_word_index'}:
+        raise SubtitleError('Word join bounded evidence is incomplete')
+    clip_start, clip_end = (timing_number(evidence[field]) for field in ('clip_start_seconds', 'clip_end_seconds'))
+    if (not 0 <= clip_start < clip_end <= duration or clip_end - clip_start > 60
+            or not clip_start <= left_start <= clip_end or not clip_start <= right_start <= clip_end):
+        raise SubtitleError('Word join requires a bounded clip covering both raw starts')
+    if (not isinstance(evidence['recheck_path'], str) or not Path(evidence['recheck_path']).is_absolute()
+            or Path(evidence['recheck_path']).suffix != '.json' or not isinstance(evidence['recheck_sha256'], str)):
+        raise SubtitleError('Word join requires an absolute raw recheck JSON path and checksum')
+    recheck_bytes = Path(evidence['recheck_path']).read_bytes()
+    if evidence['recheck_sha256'] != hashlib.sha256(recheck_bytes).hexdigest():
+        raise SubtitleError('Word join raw recheck checksum changed')
+    recheck = json.loads(recheck_bytes)
+    timed_words(recheck, clip_end - clip_start)
+    for part in recheck['candidates'][0]['content']['parts']:
+        for word in part.get('audioTranscription', {}).get('words', []):
+            if not 0 <= offset(word['startOffset']) <= offset(word['endOffset']) <= clip_end - clip_start:
+                raise SubtitleError('Word join recheck timestamp is outside the exact clip')
+    anchor = checkpoint_word(recheck, evidence['recheck_part_index'], evidence['recheck_word_index'])
+    merged = left['word'] + '%'
+    if (not same_timing_word(merged, anchor.get('word'))
+            or not math.isclose(start, clip_start + offset(anchor.get('startOffset')), rel_tol=0, abs_tol=1e-6)
+            or not math.isclose(end, clip_start + offset(anchor.get('endOffset')), rel_tol=0, abs_tol=1e-6)):
+        raise SubtitleError('Word join lacks exact merged-word audio endpoint support')
+    copied = copy.deepcopy(data)
+    words = copied['candidates'][0]['content']['parts'][entry['part_index']]['audioTranscription']['words']
+    words[entry['word_index']].update(word=merged, startOffset=start, endOffset=end)
+    del words[entry['word_index'] + 1]
+    parts = data['candidates'][0]['content']['parts']
+    local_index = sum(len(part.get('audioTranscription', {}).get('words', []))
+                      for part in parts[:entry['part_index']]) + entry['word_index']
+    return copied, {'kind': 'reviewed_word_join', **copy.deepcopy(entry),
+                    'checkpoint': str(path.resolve()), 'overlay': str(overlay_path.resolve()),
+                    'source_sha256': overlay['source_sha256'], 'local_word_index': local_index}
+
+
 def read_checkpoint(path, duration, include_corrections=False):
     """Validate immutable raw JSON, applying only explicitly verified private overlays.
 
@@ -404,8 +475,12 @@ def _read_checkpoint(path, duration, include_corrections):
     adjustments = []
     overlay_path = path.with_suffix('.timing-overrides.json')
     exclusion_path = path.with_suffix('.word-exclusions.json')
-    if overlay_path.exists() and exclusion_path.exists():
-        raise SubtitleError('Timing and word exclusion overlays cannot coexist')
+    join_path = path.with_suffix('.word-joins.json')
+    if sum(item.exists() for item in (overlay_path, exclusion_path, join_path)) > 1:
+        raise SubtitleError('Reviewed overlays cannot coexist on one checkpoint')
+    if join_path.exists():
+        data, adjustment = reviewed_join(data, path, raw_bytes, duration)
+        adjustments.append(adjustment)
     if exclusion_path.exists():
         data, adjustment = reviewed_exclusion(data, path, raw_bytes, duration)
         adjustments.append(adjustment)
@@ -714,7 +789,8 @@ class RequestPool:
 
     def transcribe(self, audio, output, duration, configuration):
         if (output.exists() or output.with_suffix('.timing-overrides.json').exists()
-                or output.with_suffix('.word-exclusions.json').exists()):
+                or output.with_suffix('.word-exclusions.json').exists()
+                or output.with_suffix('.word-joins.json').exists()):
             return self.checked_checkpoint(output, duration)
         marker = output.with_suffix('.inflight.json')
         if marker.exists():
@@ -1191,7 +1267,8 @@ def process_episode(video, args, pool):
                     index = chunk['index']
                     checkpoint = cache / f'chunk-{index:03}.json'
                     if (checkpoint.exists() or checkpoint.with_suffix('.timing-overrides.json').exists()
-                            or checkpoint.with_suffix('.word-exclusions.json').exists()):
+                            or checkpoint.with_suffix('.word-exclusions.json').exists()
+                            or checkpoint.with_suffix('.word-joins.json').exists()):
                         data = read_checkpoint(checkpoint, chunk['end'] - chunk['start'])
                         results[index] = data
                     elif args.format_only:
@@ -1231,7 +1308,7 @@ def process_episode(video, args, pool):
                         words.append(word)
                 corrections, flags = repair_long_words(words, preparation['silences'],
                                                        reviewed_word_ids={item['word_id'] for item in overlay_corrections
-                                                                          if item['kind'] == 'reviewed_timing_override'})
+                                                                          if item['kind'] in ('reviewed_timing_override', 'reviewed_word_join')})
                 words.sort(key=lambda word: (word['start'], word['id']))
                 atomic_json(cache / 'words.json', words)
                 result.update(word_count=len(words), corrections=overlay_corrections + corrections,
