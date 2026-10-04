@@ -179,3 +179,12 @@ evidence, paths, checksums and merged section/global timing. The merged word's
 active ID protects its verified onset from inferred repair. Other overlays on
 the same checkpoint and orphan join overlays stop processing before requests.
 Format-only reuse, full raw usage/accounting and cache identity remain unchanged.
+
+Audio second-opinion tests use synthetic inputs and mocked responses to check
+clip bounds, model-family filtering and numeric ordering, cache reuse before
+authentication, prompt/model identity mismatch, uncertain-outcome preservation,
+bounded known rejection retries, and rejection of partial or thought-only text.
+The shared request loop retains the existing transcription overlay validation.
+
+Synthetic repository and symlink tests verify that audio opinion evidence cannot
+be cached inside public skill sources, before any media probe or cache write.

@@ -95,6 +95,7 @@ python3 -B tests/test_translate.py
 python3 -B tests/test_models.py
 python3 -B tests/test_batch.py
 python3 -B tests/test_manage.py
+python3 -B tests/test_second_opinion.py
 ```
 
 The tests exercise source locks, resumability, bounded retries, model selection,
@@ -103,3 +104,7 @@ calls. Structural checks do not prove perfect transcription or translation;
 review representative cue text and flagged timings before delivery.
 
 For test and maintenance guidance, see [validation](docs/validation.md).
+
+The creation skill also includes a bounded independent audio wording helper.
+See [audio second opinions](skills/subtitle-creation/references/audio-second-opinion.md)
+for Flash-Lite/Flash routing, private evidence caching, and concurrency limits.

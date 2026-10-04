@@ -227,3 +227,10 @@ review flags. If cost is requested, use the returned usage counters and current
 official Vertex prices, include successful retries/tests, and label it an
 estimate unless checked against the billing ledger. Keep account identifiers
 and billing figures out of public repositories.
+
+## Independent wording evidence
+
+For a bounded unclear passage, read [audio-second-opinion.md](references/audio-second-opinion.md).
+Use Flash-Lite first, then at most one Flash opinion for unresolved meaningful
+numeric or semantic disagreement. Keep independent audio text separate from
+Gemini Transcribe timing evidence and preserve approved subtitle files.

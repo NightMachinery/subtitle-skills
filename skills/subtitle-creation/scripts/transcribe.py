@@ -842,8 +842,7 @@ class RequestPool:
                 or output.with_suffix('.word-exclusions.json').exists()
                 or output.with_suffix('.word-joins.json').exists()):
             return self.checked_checkpoint(output, duration)
-        marker = output.with_suffix('.inflight.json')
-        if marker.exists():
+        if output.with_suffix('.inflight.json').exists():
             raise SubtitleError('Previous request outcome is uncertain; review its inflight checkpoint before retrying')
         location = configuration['location']
         host = 'aiplatform.googleapis.com' if location == 'global' else location + '-aiplatform.googleapis.com'
@@ -851,6 +850,24 @@ class RequestPool:
         model = urllib.parse.quote(configuration['model'], safe='')
         url = f'https://{host}/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent'
         payload = payload_for(audio, configuration)
+        return self.cached_request(output, url, payload,
+                                   lambda path: self.checked_checkpoint(path, duration))
+
+    def cached_request(self, output, url, payload, validator):
+        """Retain raw success before validation; never replay unknown outcomes."""
+        output = Path(output)
+        def checked():
+            try:
+                return validator(output)
+            except Exception:
+                with self._fatal_lock:
+                    self._fatal_error = 'API request pool stopped after response validation failed; inspect its checkpoint'
+                raise
+        if output.exists():
+            return checked()
+        marker = output.with_suffix('.inflight.json')
+        if marker.exists():
+            raise SubtitleError('Previous request outcome is uncertain; review its inflight checkpoint before retrying')
         audit_path = output.with_suffix('.requests.json')
         audit = request_audit(audit_path)
         for attempt in range(3):
@@ -917,7 +934,7 @@ class RequestPool:
                 audit['last_outcome'] = 'succeeded'
                 atomic_json(audit_path, audit)
                 marker.unlink(missing_ok=True)
-                return self.checked_checkpoint(output, duration)
+                return checked()
 
 
 def wrap_words(words):
