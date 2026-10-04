@@ -362,7 +362,7 @@ def _read_checkpoint(path, duration, include_corrections):
                    for field in ('reviewer', 'reason')):
                 raise SubtitleError('Timing override reviewer and reason are required')
             start, end = (timing_number(correction[field]) for field in ('start_seconds', 'end_seconds'))
-            if not 0 <= start < end <= duration:
+            if not 0 <= start <= end <= duration:
                 raise SubtitleError('Timing override endpoints are outside the section or reversed')
             evidence = correction['evidence']
             if not isinstance(evidence, dict) or set(evidence) != evidence_keys:

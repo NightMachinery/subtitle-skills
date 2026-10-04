@@ -226,6 +226,40 @@ class RunnerTests(unittest.TestCase):
         word = t.timed_words(data, 10)[0]
         self.assertEqual((word['start'], word['end']), (2.2, 2.6))
 
+    def test_verified_zero_word_overlay_formats_positive_cues_and_keeps_flag(self):
+        video, args, cache = fixture(self.directory)
+        path = cache / 'chunk-000.json'
+        overlay = self.timing_overlay(path)
+        raw = t.read_json(path)
+        raw['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['endOffset'] = '9s'
+        t.atomic_json(path, raw)
+        correction = overlay['corrections'][0]
+        correction.update(old_end_offset='9s', end_seconds=0.2)
+        evidence_path = Path(correction['evidence']['recheck_path'])
+        evidence = t.read_json(evidence_path)
+        evidence['candidates'][0]['content']['parts'][0]['audioTranscription']['words'][0]['endOffset'] = '0.2s'
+        t.atomic_json(evidence_path, evidence)
+        correction['evidence']['recheck_sha256'] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        overlay['source_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+        t.atomic_json(path.with_suffix('.timing-overrides.json'), overlay)
+        before = path.read_bytes()
+        args.format_only = True
+        pool = self.pool(lambda *_: self.fail('paid call'))
+        with patch.object(pool, 'token', side_effect=AssertionError('authentication called')):
+            result = t.process_episode(video, args, pool)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(path.read_bytes(), before)
+        words = t.read_json(cache / 'words.json')
+        self.assertEqual((words[0]['start'], words[0]['end']), (0.2, 0.2))
+        self.assertEqual([word['word'] for word in words], ['A', 'small', 'offline', 'test.'])
+        self.assertTrue(any(flag.get('kind') == 'implausible_word_interval'
+                            and flag.get('word_id') == 0 and flag.get('seconds') == 0
+                            for flag in result['review_flags']))
+        self.assertEqual(result['corrections'][0]['end_seconds'], 0.2)
+        cues = t.read_json(cache / 'cues.json')
+        self.assertTrue(all(cue['end'] > cue['start'] for cue in cues))
+        self.assertTrue(t.valid_srt(Path(result['output'])))
+
     def test_timing_overlay_rejects_checksum_identity_indices_and_extra_changes(self):
         path = self.directory / 'chunk-000.json'
         valid = self.timing_overlay(path)
@@ -260,6 +294,7 @@ class RunnerTests(unittest.TestCase):
                    ('clip range', lambda value: value['evidence'].update(clip_end_seconds=11)),
                    ('clip reversed', lambda value: value['evidence'].update(clip_start_seconds=4)),
                    ('unsupported time', lambda value: value.update(start_seconds=0.25)),
+                   ('unsupported zero', lambda value: value.update(end_seconds=0.2)),
                    ('nonfinite', lambda value: value.update(start_seconds=float('nan'))),
                    ('boolean time', lambda value: value.update(end_seconds=True)),
                    ('reversed', lambda value: value.update(start_seconds=0.7)),

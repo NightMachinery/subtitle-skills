@@ -146,9 +146,10 @@ both endpoints may an agent explicitly author a private adjacent
 identity, reviewer/reason and bounded audio evidence are validated before the
 runner applies offsets to an in-memory copy. Read the strict schema in
 [validation guidance](../../docs/validation.md#explicit-reviewed-timing-overlays).
-Never guess an endpoint, silently edit raw responses, or create an overlay to
-bypass unresolved evidence. Overlay provenance stays in final private review
-flags and corrections; approved existing SRTs remain protected. Use the same
+A zero-duration word anchor can support the same exact point; retain its flag
+and require positive final cue durations. Never invent an endpoint, silently
+edit raw responses, or create an overlay to bypass unresolved evidence. Overlay
+provenance stays in final private review flags and corrections; approved existing SRTs remain protected. Use the same
 cache and model settings with `--format-only` after review, without paying to
 repeat successful transcription. A fresh successful response with invalid
 timing stops queued sections and remains cached without an uncertain marker.

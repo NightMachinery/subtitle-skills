@@ -55,7 +55,8 @@ has exactly these fields:
 - `word`, `old_start_offset`, `old_end_offset`: exact original word and offset
   values, including offset value types and original string spelling.
 - `start_seconds`, `end_seconds`: finite numeric section-local endpoints,
-  ordered strictly and inside the section.
+  ordered without reversal and inside the section. Equal endpoints are allowed
+  only when the indexed raw recheck word also has equal endpoints.
 - `reviewer`, `reason`: nonempty text identifying the review and its purpose.
 - `evidence`: the exact object described below.
 
@@ -69,6 +70,12 @@ duration. The indexed anchor must have the same word text. Proposed endpoints
 must equal clip start plus its actual raw offsets, with only one microsecond of
 floating-point tolerance. Manual claims without this retained word anchor are
 not accepted.
+
+A recheck may represent a brief word as a zero-duration point. Preserve that
+exact point rather than inventing an endpoint. The original interval warning
+remains in review flags, and final subtitle cues must still have positive,
+ordered, nonoverlapping durations and preserve every word. A zero-duration
+overlay unsupported by the indexed raw anchor is rejected.
 
 The centralized `read_checkpoint` validates the overlay even if the raw words
 already pass timing checks. It changes only offsets in an in-memory deep copy;
