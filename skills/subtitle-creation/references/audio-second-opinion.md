@@ -1,17 +1,18 @@
 # Bounded audio wording opinion
 
 Use `scripts/second_opinion.py` for independent text evidence about a short
-unclear passage. Start with the latest available Flash-Lite for an inexpensive
-wording check. If an important number or semantic disagreement remains, obtain
-one Flash opinion for the same bounded passage. Automatic model selection uses
-the read-only catalog and pins the selected model in the private cache.
+unclear passage. Use the latest available Gemini Flash directly. Automatic model
+selection uses the read-only catalog and pins the selected model in the private
+cache. Do not repeat a successful opinion merely because uncertainty remains.
 
 ```sh
 python3 scripts/second_opinion.py input.mp4 --start 10 --end 30 --cache /tmp/opinion-cache
 ```
 
-A clip must be within the media and at most 60 seconds. `--family flash` selects
-Flash; `--model` explicitly selects a verified identifier without fallback.
+A clip must be within the media and at most 60 seconds. Flash is the default;
+`--family flash-lite` is available only when explicitly requested. `--model`
+selects a verified identifier without fallback. To reuse a prior Lite cache,
+pass its original `--family flash-lite`; do not create a new cache to repeat it.
 `--prompt-file` accepts a private user prompt verbatim without sourcing shell
 configuration. The bundled prompt detects any language and produces clean text.
 Do not seed the prompt with the original transcript or candidate corrections.

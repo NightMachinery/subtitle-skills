@@ -107,4 +107,4 @@ For test and maintenance guidance, see [validation](docs/validation.md).
 
 The creation skill also includes a bounded independent audio wording helper.
 See [audio second opinions](skills/subtitle-creation/references/audio-second-opinion.md)
-for Flash-Lite/Flash routing, private evidence caching, and concurrency limits.
+for latest-Flash selection, private evidence caching, and concurrency limits.

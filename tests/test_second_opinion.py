@@ -36,6 +36,14 @@ class OpinionTests(unittest.TestCase):
                 with self.assertRaises(SubtitleError): so.opinion('unused',cache,0,1,'Synthetic prompt')
             self.assertFalse(cache.exists())
 
+    def test_cli_flash_default_and_explicit_lite(self):
+        with tempfile.TemporaryDirectory() as d:
+            for extra, expected in (([], 'flash'), (['--family', 'flash-lite'], 'flash-lite')):
+                args=['second_opinion.py','synthetic.mp4','--start','0','--end','5','--cache',d]+extra
+                with patch.object(sys,'argv',args), patch.object(so,'select_project',return_value='synthetic'), patch.object(so,'opinion',return_value='Synthetic speech.') as request, patch('builtins.print'):
+                    self.assertEqual(so.main(),0)
+                self.assertEqual(request.call_args.args[5],expected)
+
     def test_bounds(self):
         so.bounds(0, 60, 90)
         for values in [(0,61,90),(-1,2,90),(2,2,90),(0,3,2),(float('nan'),2,90),(0,float('inf'),90)]:
@@ -98,12 +106,12 @@ class OpinionTests(unittest.TestCase):
             cache=Path(d)/'cache'; pool=RequestPool(1,project='synthetic',request=lambda *_:GOOD)
             pool.token=lambda:'fake'
             def command(args): Path(args[-1]).write_bytes(b'synthetic clip')
-            with patch.object(so,'probe',return_value=10), patch.object(so,'command',side_effect=command), patch.object(so,'catalog',return_value=[{'name':'gemini-3.10-flash-lite'}]):
+            with patch.object(so,'probe',return_value=10), patch.object(so,'command',side_effect=command), patch.object(so,'catalog',return_value=[{'name':'gemini-3.10-flash'},{'name':'gemini-9-flash-lite'}]):
                 self.assertEqual(so.opinion(media,cache,0,5,'Synthetic prompt',pool=pool),'Synthetic speech.')
             with patch.object(so,'probe',return_value=10), patch.object(so,'catalog',side_effect=AssertionError('discovery')):
                 self.assertEqual(so.opinion(media,cache,0,5,'Synthetic prompt'),'Synthetic speech.')
                 with self.assertRaises(SubtitleError): so.opinion(media,cache,0,5,'Different prompt')
-                with self.assertRaises(SubtitleError): so.opinion(media,cache,0,5,'Synthetic prompt',model='gemini-4-flash-lite')
+                with self.assertRaises(SubtitleError): so.opinion(media,cache,0,5,'Synthetic prompt',model='gemini-4-flash')
 
     def synthetic_cache(self, folder):
         media=Path(folder)/'synthetic'; media.write_bytes(b'synthetic source')
@@ -111,7 +119,7 @@ class OpinionTests(unittest.TestCase):
         pool=RequestPool(1,project='synthetic',request=lambda *_:GOOD)
         pool.token=lambda:'fake'
         def command(args): Path(args[-1]).write_bytes(b'synthetic clip')
-        with patch.object(so,'probe',return_value=10), patch.object(so,'command',side_effect=command), patch.object(so,'catalog',return_value=[{'name':'gemini-3.10-flash-lite'}]):
+        with patch.object(so,'probe',return_value=10), patch.object(so,'command',side_effect=command), patch.object(so,'catalog',return_value=[{'name':'gemini-3.10-flash'},{'name':'gemini-9-flash-lite'}]):
             so.opinion(media,cache,0,5,'Synthetic prompt',pool=pool)
         pool.token=lambda: self.fail('authentication on corrupt cache')
         pool.request=lambda *_: self.fail('replayed corrupt cache')
@@ -132,7 +140,7 @@ class OpinionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             media,cache,pool=self.synthetic_cache(d)
             identity=json.loads((cache/'identity.json').read_text())
-            for model in (None, 42, 'gemini-3.10-flash', 'gemini-3.10-flash-lite-image', '../unexpected'):
+            for model in (None, 42, 'gemini-3.10-flash-lite', 'gemini-3.10-flash-image', '../unexpected'):
                 with self.subTest(model=model):
                     atomic_json(cache/'identity.json',dict(identity,model=model))
                     with patch.object(so,'probe',return_value=10), patch.object(so,'catalog',side_effect=AssertionError('discovery')):

@@ -76,7 +76,7 @@ def digest(path):
     return h.hexdigest()
 
 
-def opinion(media, cache, start, end, prompt, family='flash-lite', model='auto',
+def opinion(media, cache, start, end, prompt, family='flash', model='auto',
             project=None, location='global', pool=None, max_tokens=2048):
     """Caller may share a RequestPool with other work; each cache is one opinion."""
     if family not in {'flash', 'flash-lite'} or not re.fullmatch(r'[a-zA-Z0-9._-]+', model) or (model != 'auto' and model_key({'name': model}, family) is None):
@@ -163,7 +163,7 @@ def main():
     parser.add_argument('--cache', required=True, type=Path)
     parser.add_argument('--start', required=True, type=float)
     parser.add_argument('--end', required=True, type=float)
-    parser.add_argument('--family', choices=['flash-lite','flash'], default='flash-lite')
+    parser.add_argument('--family', choices=['flash-lite','flash'], default='flash')
     parser.add_argument('--model', default='auto')
     parser.add_argument('--prompt-file', type=Path, default=DEFAULT_PROMPT)
     parser.add_argument('--project')

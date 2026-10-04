@@ -181,8 +181,9 @@ the same checkpoint and orphan join overlays stop processing before requests.
 Format-only reuse, full raw usage/accounting and cache identity remain unchanged.
 
 Audio second-opinion tests use synthetic inputs and mocked responses to check
-clip bounds, model-family filtering and numeric ordering, cache reuse before
-authentication, prompt/model identity mismatch, uncertain-outcome preservation,
+clip bounds, default Flash routing, explicit Lite selection, model-family filtering
+and numeric ordering, cache reuse before authentication, prompt/model identity
+mismatch, uncertain-outcome preservation,
 bounded known rejection retries, and rejection of partial or thought-only text.
 The shared request loop retains the existing transcription overlay validation.
 
